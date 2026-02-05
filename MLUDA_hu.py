@@ -187,6 +187,7 @@ for iDataSet in range(nDataSet):
             accuracies = []
             predict = np.array([], dtype=np.int64)
             labels = np.array([], dtype=np.int64)
+
             with torch.no_grad():
                 for test_datas, test_labels in test_loader:
                     batch_size = test_labels.shape[0]

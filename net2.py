@@ -111,7 +111,7 @@ class DSAN2(nn.Module):
     def __init__(self, n_band=198, patch_size=3,num_class=3):
         super(DSAN1, self).__init__()
         self.n_outputs = 152
-        self.feature_layers = DCRN(n_band,patch_size,num_class)
+        self.feature_layers = DCRN_Mamba(n_band,patch_size,num_class)
 
         self.fc1 = nn.Linear(self.n_outputs, num_class)
         self.fc2 = nn.Linear(self.n_outputs, 1)
