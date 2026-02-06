@@ -20,7 +20,7 @@ from config_Houston import *
 from sklearn import svm
 from UtilsCMS import *
 import os
-
+from eta_mamba_modules import TemporalPrototypeManager
 ##################################
 # 0. 准备工作
 if not os.path.exists('classificationMap/Houston'):
@@ -74,7 +74,9 @@ for iDataSet in range(nDataSet):
 
     # model
     feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()
-    delta_phys = torch.zeros(288).cuda()
+    # delta_phys = torch.zeros(288).cuda()
+    proto_manager = TemporalPrototypeManager(class_num=CLASS_NUM, feature_dim=288, momentum=0.9)
+    active_queried_indices = []
     print("Training...")
 
     last_accuracy = 0.0
@@ -132,9 +134,17 @@ for iDataSet in range(nDataSet):
             (source_features, source1, _, source_outputs, source_out,
              target_features, _, target1, target_outputs, target_out) = feature_encoder(source_data.cuda(),
                                                                                         target_data.cuda())
-            mu_s = torch.mean(source_features, dim=0)
-            mu_t = torch.mean(target_features, dim=0)
-            pa_loss = torch.norm(mu_t - (mu_s + delta_phys), p=2)
+            # mu_s = torch.mean(source_features, dim=0)
+            # mu_t = torch.mean(target_features, dim=0)
+            # pa_loss = torch.norm(mu_t - (mu_s + delta_phys), p=2)
+
+            softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
+            _, pseudo_label_t = torch.max(softmax_output_t, 1)
+
+            # 更新源域原型 & 计算带物理约束的对齐 Loss
+            proto_manager.update(source_features.detach(), source_label.cuda())
+            pa_loss = proto_manager.get_aligned_loss(target_features, pseudo_label_t)
+
             (_, source2, _, source_outputs2, _,
              _, _, target2, t1, _) = feature_encoder(source_data0.cuda(), target_data0.cuda())
             (_, source3, _, source_outputs3, _,
@@ -205,24 +215,76 @@ for iDataSet in range(nDataSet):
 
                     predict = np.append(predict, pred.cpu().numpy())
                     labels = np.append(labels, test_labels)
+
             test_end = time.time()  # [新增] 修正推理耗时计算错误
-            if epoch % 10 == 0:  # 每10个Epoch进行一次主动筛选，降低计算开销
+
+            if epoch % 20 == 0 and epoch < epochs:
+                print(f">>> Active Learning Query at Epoch {epoch}...")
                 feature_encoder.eval()
                 all_entropies = []
-                with torch.no_grad():
-                    for test_datas, _ in test_loader:
-                        # 这里的 test_outputs 是目标域的预测结果
-                        _, _, _, _, _, _, _, _, test_outputs, _ = feature_encoder(source_data.cuda(), test_datas.cuda())
-                        # 计算预测熵 (Entropy)
-                        softmax_out = F.softmax(test_outputs, dim=1)
-                        entropy = -torch.sum(softmax_out * torch.log(softmax_out + 1e-6), dim=1)
-                        all_entropies.append(entropy)
 
-                # 将所有 Batch 的熵合并
+                # 1. 遍历目标域计算熵
+                # 注意：为了下标对齐，这里临时用不打乱的 loader
+                eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+                with torch.no_grad():
+                    for t_data, _ in eval_loader:
+                        # 构造 dummy source 以便通过 forward
+                        dummy_s = torch.zeros_like(t_data)
+                        _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
+
+                        probs = F.softmax(t_out, dim=1)
+                        entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
+                        all_entropies.append(entropy.cpu())
+
                 all_entropies = torch.cat(all_entropies)
-                # 筛选出熵值最高（模型最不确定）的前 1% 样本
-                _, active_indices = torch.topk(all_entropies, k=int(0.01 * len(all_entropies)))
-                print(f">>> Active Learning: Epoch {epoch}, 识别出 {len(active_indices)} 个高信息量样本进行重点迁移。")
+
+                # 2. 筛选 Top-K 高熵样本 (最具信息量)
+                # 排除已查询过的
+                candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
+                if active_queried_indices:
+                    candidate_mask[active_queried_indices] = False
+
+                valid_entropies = all_entropies  # 简化逻辑：在所有样本中找
+                # 如果想严格排除，应该只在 candidate_mask 中找，这里为了代码简单，假设 topk 可能包含旧的，下面再过滤
+
+                k = int(0.01 * len(test_dataset))  # 选 1%
+                _, topk_indices = torch.topk(all_entropies, k)
+
+                new_queries = []
+                for idx in topk_indices.tolist():
+                    if idx not in active_queried_indices:
+                        new_queries.append(idx)
+                        active_queried_indices.append(idx)
+
+                # 3. [闭环关键] 将新样本加入训练集
+                if new_queries:
+                    print(f"    Added {len(new_queries)} samples to training set.")
+                    # 模拟打标：从 target_dataset 中获取真实数据和标签
+                    # 注意：这里我们假设 train_dataset 和 test_dataset 都是 TensorDataset
+                    # 我们可以直接访问 tensors
+
+                    # 获取原始 Tensor
+                    current_source_x = train_loader_s.dataset.tensors[0]
+                    current_source_y = train_loader_s.dataset.tensors[1]
+
+                    target_x_all = test_loader.dataset.tensors[0]
+                    target_y_all = test_loader.dataset.tensors[1]
+
+                    # 提取新样本
+                    query_x = target_x_all[new_queries]
+                    query_y = target_y_all[new_queries]  # 使用真实标签 (Oracle)
+
+                    # 拼接到源域数据中
+                    new_source_x = torch.cat([current_source_x, query_x], dim=0)
+                    new_source_y = torch.cat([current_source_y, query_y], dim=0)
+
+                    # 重新构建 DataLoader
+                    new_train_dataset = TensorDataset(new_source_x, new_source_y)
+                    # 更新全局的 loader 变量
+                    train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+                    print(f"    Source Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
             # 计算本轮 OA
             test_accuracy = 100. * total_rewards / len(test_loader.dataset)
             oa_list.append(test_accuracy)
