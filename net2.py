@@ -1,5 +1,5 @@
-# -*- coding:utf-8 -*-
-# Modified for ETA-Mamba Speedup
+# [文件名: net2.py]
+# High-Accuracy Hybrid Architecture (Deep CNN + Mamba)
 
 import torch
 import torch.nn as nn
@@ -7,32 +7,65 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba
 
 
-# ... (保持 BiSSMBlock 和其他辅助类不变) ...
+# ----------------- 1. 基础模块定义 -----------------
+
 class BiSSMBlock(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        # 这里的 d_state 和 d_conv 可以根据显存调整
-        self.forward_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.backward_mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
-        self.combine = nn.Linear(d_model * 2, d_model)
         self.norm = nn.LayerNorm(d_model)
+        self.forward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.backward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.combine = nn.Linear(d_model * 2, d_model)
 
     def forward(self, x):
         # x shape: (B, L, D)
-        # 归一化有助于 Mamba 收敛
+        residual = x
         x = self.norm(x)
         out_f = self.forward_mamba(x)
-        # 后向 Mamba 需要翻转序列
         out_b = self.backward_mamba(x.flip(dims=[1])).flip(dims=[1])
-        return self.combine(torch.cat([out_f, out_b], dim=-1))
+        out = self.combine(torch.cat([out_f, out_b], dim=-1))
+        return out + residual  # [关键] 残差连接，防止梯度消失
 
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.max_pool = nn.AdaptiveMaxPool3d(1)
+        self.fc1 = nn.Conv3d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv3d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv3d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+# ----------------- 2. 主模型定义 -----------------
 
 class DSANSS(nn.Module):
-    # ... (DSANSS 类主体保持不变，主要是 DCRN_Mamba 的调用) ...
     def __init__(self, n_band=198, patch_size=3, num_class=3):
         super(DSANSS, self).__init__()
         self.n_outputs = 288
-        # 调用修改后的 DCRN_Mamba
         self.feature_layers = DCRN_Mamba(n_band, patch_size, num_class)
 
         self.fc1 = nn.Linear(288, num_class)
@@ -42,7 +75,6 @@ class DSANSS(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, y):
-        # ... (保持原有的 forward 逻辑) ...
         features_x, features_y = self.feature_layers(x, y)
 
         x1 = F.normalize(self.head1(features_x), dim=1)
@@ -63,15 +95,15 @@ class DSANSS(nn.Module):
 class DCRN_Mamba(nn.Module):
     def __init__(self, input_channels, patch_size, n_classes):
         super(DCRN_Mamba, self).__init__()
-        # ... (前部的 Conv3d 定义保持不变，此处省略以节省篇幅，请保留原代码中的 conv1 到 conv10) ...
-        self.kernel_dim = 1
         self.feature_dim = input_channels
         self.sz = patch_size
 
-        # --- 复制你原有的卷积层定义 ---
+        # --- 分支 1: 光谱特征 (Deep Spectral Branch) ---
         self.conv1 = nn.Conv3d(1, 24, kernel_size=(7, 1, 1), stride=(2, 1, 1), bias=True)
         self.bn1 = nn.BatchNorm3d(24)
         self.activation1 = nn.ReLU()
+
+        # 残差块 1 (恢复深度)
         self.conv2 = nn.Conv3d(24, 24, kernel_size=(7, 1, 1), stride=1, padding=(3, 0, 0), bias=True)
         self.bn2 = nn.BatchNorm3d(24)
         self.activation2 = nn.ReLU()
@@ -83,74 +115,82 @@ class DCRN_Mamba(nn.Module):
         self.bn4 = nn.BatchNorm3d(192)
         self.activation4 = nn.ReLU()
 
+        # --- 分支 2: 空间特征 (Deep Spatial Branch) ---
         self.conv5 = nn.Conv3d(1, 24, (self.feature_dim, 1, 1))
         self.bn5 = nn.BatchNorm3d(24)
         self.activation5 = nn.ReLU()
 
+        # 残差块 2 (恢复深度)
         self.conv6 = nn.Conv3d(24, 24, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1), bias=True)
         self.bn6 = nn.BatchNorm3d(24)
         self.activation6 = nn.ReLU()
         self.conv7 = nn.Conv3d(24, 96, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1), bias=True)
         self.bn7 = nn.BatchNorm3d(96)
         self.activation7 = nn.ReLU()
-        self.conv8 = nn.Conv3d(24, 96, kernel_size=1)
+
+        self.conv8 = nn.Conv3d(24, 96, kernel_size=1)  # Residual connection helper
 
         self.inter_size = 192 + 96  # 288
 
-        # Attention Modules
+        # --- 全局特征优化 (Mamba + Attention) ---
+        # 使用 Mamba 建模空间序列 (49个Token)
+        self.mamba_block = BiSSMBlock(d_model=self.inter_size)
+
         self.ca = ChannelAttention(self.inter_size)
         self.sa = SpatialAttention()
 
-        # [关键修改] Mamba Backbone
-        # 输入维度 288，用于替代池化前的空间特征提取
-        self.mamba_backbone = BiSSMBlock(d_model=self.inter_size)
-
-        # 这里的 avgpool 现在仅作为最后的降维手段，或者被 Mamba 的 mean 替代
-        self.avgpool = nn.AvgPool3d((1, self.sz, self.sz))
-
     def forward_features_cnn(self, x):
-        # 封装 CNN 部分，避免代码重复
         x = x.unsqueeze(1)
+
+        # Branch 1
         x1 = self.activation1(self.bn1(self.conv1(x)))
         residual = x1
         x1 = self.activation2(self.bn2(self.conv2(x1)))
-        x1 = self.activation3(self.bn3(self.conv3(x1))) + residual
-
+        x1 = self.activation3(self.bn3(self.conv3(x1))) + residual  # 残差连接
         x1 = self.activation4(self.bn4(self.conv4(x1)))
         x1 = x1.reshape(x1.size(0), x1.size(1), x1.size(3), x1.size(4))
 
+        # Branch 2
         x2 = self.activation5(self.bn5(self.conv5(x)))
         residual = self.conv8(x2)
         x2 = self.activation6(self.bn6(self.conv6(x2)))
-        x2 = self.activation7(self.bn7(self.conv7(x2))) + residual
+        x2 = self.activation7(self.bn7(self.conv7(x2))) + residual  # 残差连接
         x2 = x2.reshape(x2.size(0), x2.size(1), x2.size(3), x2.size(4))
 
         out = torch.cat((x1, x2), 1)  # (B, 288, H, W)
         return out
 
     def forward(self, x, y):
-        # 1. 提取基础特征 (3D CNN)
-        x_feat = self.forward_features_cnn(x)  # (B, 288, 7, 7)
-        y_feat = self.forward_features_cnn(y)  # (B, 288, 7, 7)
+        # 1. Deep 3D-CNN 提取 (Robust Features)
+        x_feat = self.forward_features_cnn(x)
+        y_feat = self.forward_features_cnn(y)
 
-        # 2. 空间-通道注意力 (保持轻量级)
+        # 2. Mamba 全局建模 (Global Context)
+        # 变换为序列: (B, 288, H, W) -> (B, H*W, 288)
+        B, C, H, W = x_feat.shape
+        x_seq = x_feat.view(B, C, -1).permute(0, 2, 1)
+        y_seq = y_feat.view(B, C, -1).permute(0, 2, 1)
+
+        x_seq = self.mamba_block(x_seq)  # Mamba 处理
+        y_seq = self.mamba_block(y_seq)
+
+        # 变回图像维度以便进行 Attention
+        x_feat = x_seq.permute(0, 2, 1).view(B, C, H, W)
+        y_feat = y_seq.permute(0, 2, 1).view(B, C, H, W)
+
+        # 3. 3D Attention (Refinement)
+        # 维度适配: (B, C, H, W) -> (B, C, 1, H, W)
+        x_feat = x_feat.unsqueeze(2)
+        y_feat = y_feat.unsqueeze(2)
+
         x_feat = self.ca(x_feat) * self.sa(x_feat) * x_feat
         y_feat = self.ca(y_feat) * self.sa(y_feat) * y_feat
 
-        # 3. [核心加速点] Mamba 序列建模
-        # 将 (B, C, H, W) -> (B, H*W, C)
-        B, C, H, W = x_feat.shape
-        x_seq = x_feat.view(B, C, -1).permute(0, 2, 1)  # (B, 49, 288)
-        y_seq = y_feat.view(B, C, -1).permute(0, 2, 1)
+        x_feat = x_feat.squeeze(2)
+        y_feat = y_feat.squeeze(2)
 
-        # Mamba 在序列维度 (49) 上运行，捕捉空间关系
-        # 这比先池化成 1x1 再进 Mamba 有效得多
-        x_mamba = self.mamba_backbone(x_seq)  # (B, 49, 288)
-        y_mamba = self.mamba_backbone(y_seq)
-
-        # 4. 全局平均池化 (聚合空间信息)
-        # 替代原本的 self.avgpool
-        feat_x = x_mamba.mean(dim=1)  # (B, 288)
-        feat_y = y_mamba.mean(dim=1)  # (B, 288)
+        # 4. Global Pooling
+        feat_x = x_feat.mean(dim=(2, 3))  # (B, 288)
+        feat_y = y_feat.mean(dim=(2, 3))
 
         return feat_x, feat_y

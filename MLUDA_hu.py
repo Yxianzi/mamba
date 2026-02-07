@@ -64,9 +64,9 @@ for iDataSet in range(nDataSet):
     train_dataset = TensorDataset(torch.from_numpy(trainX), torch.from_numpy(trainY).long())
     test_dataset = TensorDataset(torch.from_numpy(testX), torch.from_numpy(testY).long())
 
-    train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
 
     len_source_loader = len(train_loader_s)
@@ -86,6 +86,7 @@ for iDataSet in range(nDataSet):
     # [新增] 记录详细曲线数据
     oa_list = []  # Overall Accuracy
     aa_list = []  # Average Accuracy
+    kappa_list = []
 
     test_acc = []
     running_D_loss, running_F_loss = 0.0, 0.0
@@ -176,6 +177,10 @@ for iDataSet in range(nDataSet):
             # Update parameters
             optimizer.zero_grad()
             loss.backward()
+
+            # [新增] 梯度裁剪：防止梯度爆炸导致 Loss 变 nan
+            # max_norm 通常设为 1.0 到 5.0 之间
+            torch.nn.utils.clip_grad_norm_(feature_encoder.parameters(), max_norm=5.0)
             optimizer.step()
 
             pred = source_outputs.data.max(1)[1]
@@ -248,8 +253,14 @@ for iDataSet in range(nDataSet):
                 valid_entropies = all_entropies  # 简化逻辑：在所有样本中找
                 # 如果想严格排除，应该只在 candidate_mask 中找，这里为了代码简单，假设 topk 可能包含旧的，下面再过滤
 
-                k = int(0.01 * len(test_dataset))  # 选 1%
-                _, topk_indices = torch.topk(all_entropies, k)
+                # [修改方案] 限制最大样本数为 100，避免冲击过大
+                limit_percent = int(0.01 * len(test_dataset))
+                num_query = min(limit_percent, 100)  # 取 1% 和 100 中的较小值
+
+                if num_query > 0:
+                    _, topk_indices = torch.topk(all_entropies, num_query)
+
+                    new_queries = []
 
                 new_queries = []
                 for idx in topk_indices.tolist():
@@ -295,12 +306,16 @@ for iDataSet in range(nDataSet):
             aa_value = 100. * np.mean(AA_current)  # AA值
             aa_list.append(aa_value)
 
+            #Kappa 计算
+            current_kappa = metrics.cohen_kappa_score(labels, predict)
+            kappa_list.append(current_kappa * 100)
+
             acc[iDataSet] = test_accuracy
 
             # 记录最后一次的 Kappa 等
             k[iDataSet] = metrics.cohen_kappa_score(labels, predict)
 
-            print('\tOA: {:.2f}% | AA: {:.2f}%'.format(test_accuracy, aa_value))
+            print('\tOA: {:.2f}% | AA: {:.2f}% | Kappa: {:.4f}'.format(test_accuracy, aa_value, current_kappa))
 
             # [关键修改] 如果发现当前是 Best Epoch，记录下所有的详细数据（包括Class Acc）
             if test_accuracy > last_accuracy:
@@ -376,7 +391,7 @@ ax1.set_xlabel('Epoch')
 ax1.set_ylabel('Accuracy (%)', color=color)
 # 绘制 OA 和 AA
 line1 = ax1.plot(range(1, len(oa_list) + 1), oa_list, label='OA (Overall Acc)', color='red', linestyle='-')
-line2 = ax1.plot(range(1, len(aa_list) + 1), aa_list, label='AA (Average Acc)', color='orange', linestyle='--')
+line2 = ax1.plot(range(1, len(kappa_list) + 1), kappa_list, label='Kappa (x100)', color='orange', linestyle='--')
 ax1.tick_params(axis='y', labelcolor=color)
 ax1.set_ylim([0, 100])  # 精度固定在0-100之间
 
