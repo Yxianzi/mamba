@@ -1,8 +1,8 @@
 nDataSet = 1
 
 BATCH_SIZE = 32
-epochs = 10
-lr = 0.01
+epochs = 150
+lr = 1e-3
 CLASS_NUM = 7
 nBand = 48
 HalfWidth =  3
