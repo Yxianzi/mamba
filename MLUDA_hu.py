@@ -302,47 +302,78 @@ for iDataSet in range(nDataSet):
 
                 print('\t>>> Best Result Updated!')
 
-            # Active Learning Block
-            if epoch % 20 == 0 and epoch < epochs:
-                print(f">>> Active Learning Query at Epoch {epoch}...")
-                feature_encoder.eval()
-                all_entropies = []
+                # ==========================================
+                # 4. 类别均衡的主动学习 (Class-Balanced Active Learning)
+                # ==========================================
+                if epoch % 20 == 0 and epoch < epochs:
+                    print(f">>> Active Learning Query at Epoch {epoch}...")
+                    feature_encoder.eval()
+                    all_entropies = []
+                    all_preds = []  # [新增] 记录预测类别，用于均衡采样
 
-                # 计算熵 (使用不打乱的 loader)
-                eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-                with torch.no_grad():
-                    for t_data, _ in eval_loader:
-                        dummy_s = torch.zeros_like(t_data)
-                        _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
-                        probs = F.softmax(t_out, dim=1)
-                        entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
-                        all_entropies.append(entropy.cpu())
-                all_entropies = torch.cat(all_entropies)
+                    eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+                    with torch.no_grad():
+                        for t_data, _ in eval_loader:
+                            dummy_s = torch.zeros_like(t_data)
+                            _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
 
-                # 排除已选
-                candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
-                if active_queried_indices:
-                    candidate_mask[active_queried_indices] = False
+                            probs = F.softmax(t_out, dim=1)
+                            # 计算熵
+                            entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
+                            # 记录预测类别
+                            preds = torch.argmax(probs, dim=1)
 
-                valid_entropies = all_entropies.clone()
-                valid_entropies[~candidate_mask] = -1.0  # 不可选
+                            all_entropies.append(entropy.cpu())
+                            all_preds.append(preds.cpu())
 
-                # 限制数量：最多 100 个
-                limit_percent = int(0.01 * len(test_dataset))
-                num_query = min(limit_percent, 100)
+                    all_entropies = torch.cat(all_entropies)
+                    all_preds = torch.cat(all_preds)
 
-                if num_query > 0:
-                    _, topk_indices = torch.topk(valid_entropies, num_query)
+                    # 排除已选样本
+                    candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
+                    if active_queried_indices:
+                        candidate_mask[active_queried_indices] = False
+
+                    valid_entropies = all_entropies.clone()
+                    valid_entropies[~candidate_mask] = -1.0  # 已选或不合法的设为负数
+
+                    # 限制总数量，并计算每个类该分到几个名额
+                    limit_percent = int(0.01 * len(test_dataset))
+                    num_query_total = min(limit_percent, 100)
+
+                    # [核心修复] 计算每个类分配的查询数量
+                    query_per_class = max(1, num_query_total // CLASS_NUM)
 
                     new_queries = []
-                    # [修复缩进] 只有 num_query > 0 才进循环
-                    for idx in topk_indices.tolist():
-                        if idx not in active_queried_indices and valid_entropies[idx] >= 0:
-                            new_queries.append(idx)
-                            active_queried_indices.append(idx)
+
+                    # 按类别分别去寻找最高熵的样本
+                    for c in range(CLASS_NUM):
+                        # 找出模型当前预测为类 c，且尚未被查询过的样本索引
+                        class_c_mask = (all_preds == c) & candidate_mask
+                        class_c_indices = torch.nonzero(class_c_mask).squeeze(-1)
+
+                        if len(class_c_indices) > 0:
+                            # 提取这些样本的熵
+                            class_c_entropies = valid_entropies[class_c_indices]
+
+                            # 决定当前类实际取几个 (防止该类样本太少不够取)
+                            k_c = min(query_per_class, len(class_c_indices))
+
+                            if k_c > 0:
+                                # 局部 top-k
+                                _, topk_local_idx = torch.topk(class_c_entropies, k_c)
+                                # 映射回全局索引
+                                topk_global_idx = class_c_indices[topk_local_idx]
+
+                                for idx in topk_global_idx.tolist():
+                                    if idx not in active_queried_indices:
+                                        new_queries.append(idx)
+                                        active_queried_indices.append(idx)
+
+                    # 如果依然有空余名额（某些类样本不足），可以从全局再补齐（可选，这里保持简单，拿到多少是多少）
 
                     if new_queries:
-                        print(f"    Added {len(new_queries)} samples to training set.")
+                        print(f"    Added {len(new_queries)} samples to training set (Class-Balanced).")
 
                         # 获取 Tensor 数据
                         current_source_x = train_loader_s.dataset.tensors[0]
@@ -361,7 +392,6 @@ for iDataSet in range(nDataSet):
                         new_train_dataset = TensorDataset(new_source_x, new_source_y)
                         train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                                                     drop_last=True, num_workers=4, pin_memory=True)
-
                         print(f"    Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
 
 # 打印最终结果
