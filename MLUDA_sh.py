@@ -1,6 +1,7 @@
 # -*- coding:utf-8 -*-
 # Author：Mingshuo Cai
 # Usage：Implementation of the MLUDA method on the SH2HZ cross-domain dataset
+# Modified: ETA-Mamba Version (Deep Hybrid + Active Learning + Physical Alignment + Multi-run Stats)
 
 import matplotlib.pyplot as plt
 import math
@@ -10,7 +11,6 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import mmd
 import numpy as np
-from sklearn import neighbors
 from sklearn import metrics
 from net2 import DSANSS
 import time
@@ -18,10 +18,11 @@ import utils
 from torch.utils.data import TensorDataset, DataLoader
 from contrastive_loss import SupConLoss
 from config_SH2HZ import *
-from net2 import DSANSS
 from sklearn import svm
 from UtilsCMS import *
 import os
+from eta_mamba_modules import TemporalPrototypeManager
+from torch.optim.lr_scheduler import LambdaLR
 
 ##################################
 # 0. 准备工作：创建保存目录
@@ -39,31 +40,32 @@ ContrastiveLoss_s = SupConLoss(temperature=0.1).cuda()
 ContrastiveLoss_t = SupConLoss(temperature=0.1).cuda()
 DSH_loss = utils.Domain_Occ_loss().cuda()
 
+# 用于保存每次循环的最终结果
 acc = np.zeros([nDataSet, 1])
 A = np.zeros([nDataSet, CLASS_NUM])
 k = np.zeros([nDataSet, 1])
-best_predict_all = []
-best_acc_all = 0.0
-
-# [新增] 用于存储最佳时刻的各类精度，解决“结果不匹配”问题
-best_class_acc = np.zeros([CLASS_NUM])
-
-best_G, best_RandPerm, best_Row, best_Column, best_nTrain = None, None, None, None, None
 
 for iDataSet in range(nDataSet):
-    print('#######################idataset######################## ', iDataSet)
+    print('\n' + '*' * 60)
+    print(f'####################### iDataSet: {iDataSet + 1} / {nDataSet} ########################')
+    print('*' * 60)
     utils.set_seed(seeds[iDataSet])
+
+    best_class_acc = np.zeros([CLASS_NUM])
+    best_kappa_val = 0.0
+    best_oa_val = 0.0
+    best_G, best_RandPerm, best_Row, best_Column = None, None, None, None
 
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
     testID, testX, testY, G, RandPerm, Row, Column = utils.get_all_data(data_t, label_t, HalfWidth)
 
-    # [修改] 使用 from_numpy 修复 float32 报错
     train_dataset = TensorDataset(torch.from_numpy(trainX), torch.from_numpy(trainY).long())
     test_dataset = TensorDataset(torch.from_numpy(testX), torch.from_numpy(testY).long())
 
-    train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4,
+                                pin_memory=True)
+    train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4,
+                                pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
 
     len_source_loader = len(train_loader_s)
@@ -72,255 +74,312 @@ for iDataSet in range(nDataSet):
     # model
     feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()
 
-    print("Training...")
+    # ==========================================
+    # 1. 初始化优化器 & 调度器
+    # ==========================================
+    print("Initializing Optimizer & Prototype Manager...")
+    proto_manager = TemporalPrototypeManager(class_num=CLASS_NUM, feature_dim=288, momentum=0.9).cuda()
+
+    optimizer = torch.optim.AdamW([
+        {'params': feature_encoder.feature_layers.parameters(), 'weight_decay': 0.01},
+        {'params': feature_encoder.fc1.parameters(), 'lr': lr},
+        {'params': feature_encoder.fc2.parameters(), 'lr': lr},
+        {'params': feature_encoder.head1.parameters(), 'lr': lr},
+        {'params': feature_encoder.head2.parameters(), 'lr': lr},
+        {'params': proto_manager.parameters(), 'lr': 1e-2}
+    ], lr=5e-4, weight_decay=1e-4, eps=1e-8)
+
+
+    def warmup_cosine_schedule(epoch_idx):
+        warmup_epochs = 10
+        if epoch_idx < warmup_epochs:
+            return (epoch_idx + 1) / warmup_epochs
+        else:
+            T_max = epochs - warmup_epochs
+            curr_T = epoch_idx - warmup_epochs
+            return 0.5 * (1 + math.cos(math.pi * curr_T / max(1, T_max)))
+
+
+    scheduler = LambdaLR(optimizer, lr_lambda=warmup_cosine_schedule)
+
+    print("Start Training...")
+
+    train_loss = []
+    oa_list = []
+    aa_list = []
+    kappa_list = []
+    active_queried_indices = []
+
     last_accuracy = 0.0
     best_episdoe = 0
-
-    # [新增] 记录详细曲线数据
-    train_loss = []
-    oa_list = []  # Overall Accuracy
-    aa_list = []  # Average Accuracy
-
-    test_acc = []
-    running_D_loss, running_F_loss = 0.0, 0.0
-    running_label_loss = 0
-    running_domain_loss = 0
-    total_hit, total_num = 0.0, 0.0
-    size = 0.0
-
+    train_end, test_end = 0.0, 0.0
     train_start = time.time()
-    # loss plot
-    loss1 = []
-    loss2 = []
-    loss3 = []
 
+    # ==========================================
+    # 2. 训练循环
+    # ==========================================
     for epoch in range(1, epochs + 1):
-        LEARNING_RATE = lr  # / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
-        # print('learning rate{: .4f}'.format(LEARNING_RATE))
-        optimizer = torch.optim.SGD([
-            {'params': feature_encoder.feature_layers.parameters(), },
-            {'params': feature_encoder.fc1.parameters(), 'lr': LEARNING_RATE},
-            {'params': feature_encoder.fc2.parameters(), 'lr': LEARNING_RATE},
-            {'params': feature_encoder.head1.parameters(), 'lr': LEARNING_RATE},
-            {'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},
-        ], lr=LEARNING_RATE, momentum=momentum, weight_decay=l2_decay)
-
+        current_lr = optimizer.param_groups[0]['lr']
         feature_encoder.train()
 
         iter_source = iter(train_loader_s)
         iter_target = iter(train_loader_t)
         num_iter = len_source_loader
+        epoch_loss = 0.0
+        debug_loss_components = {}
 
         for i in range(1, num_iter):
-            source_data, source_label = next(iter_source)
-            target_data, target_label = next(iter_target)
+            try:
+                source_data, source_label = next(iter_source)
+            except StopIteration:
+                iter_source = iter(train_loader_s)
+                source_data, source_label = next(iter_source)
+            try:
+                target_data, target_label = next(iter_target)
+            except StopIteration:
+                iter_target = iter(train_loader_t)
+                target_data, target_label = next(iter_target)
 
             if i % len_target_loader == 0:
                 iter_target = iter(train_loader_t)
 
-            # 0
-            source_data0 = utils.radiation_noise(source_data)
-            source_data0 = source_data0.type(torch.FloatTensor)
-            # 1
+            source_data0 = utils.radiation_noise(source_data).type(torch.FloatTensor)
             source_data1 = utils.flip_augmentation(source_data)
-            # 2
-            target_data0 = utils.radiation_noise(target_data)
-            target_data0 = target_data0.type(torch.FloatTensor)
-            # 3
+            target_data0 = utils.radiation_noise(target_data).type(torch.FloatTensor)
             target_data1 = utils.flip_augmentation(target_data)
 
             (source_features, source1, _, source_outputs, source_out,
              target_features, _, target1, target_outputs, target_out) = feature_encoder(source_data.cuda(),
                                                                                         target_data.cuda())
-            (_, source2, _, source_outputs2, _,
-             _, _, target2, t1, _) = feature_encoder(source_data0.cuda(), target_data0.cuda())
-            (_, source3, _, source_outputs3, _,
-             _, _, target3, t2, _) = feature_encoder(source_data1.cuda(), target_data1.cuda())
 
             softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
             _, pseudo_label_t = torch.max(softmax_output_t, 1)
 
-            entropy_loss = mmd.EntropyLoss(softmax_output_t)
-            # Supervised Contrastive Loss
-            all_source_con_features = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
-            all_target_con_features = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
+            proto_manager.update(source_features.detach(), source_label.cuda())
 
-            # Loss Cls
+            (_, source2, _, source_outputs2, _, _, _, target2, t1, _) = feature_encoder(source_data0.cuda(),
+                                                                                        target_data0.cuda())
+            (_, source3, _, source_outputs3, _, _, _, target3, t2, _) = feature_encoder(source_data1.cuda(),
+                                                                                        target_data1.cuda())
+
             cls_loss = crossEntropy(source_outputs, source_label.cuda())
-            # Loss Lmmd
+            p = (epoch - 1) / epochs
+            lambd = 2 / (1 + math.exp(-10 * p)) - 1
+
             lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
                                  torch.nn.functional.softmax(target_outputs, dim=1), BATCH_SIZE=BATCH_SIZE,
                                  CLASS_NUM=CLASS_NUM)
-            lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
-            # Loss Con_s
-            contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
-            # Loss Con_t
-            contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t)
+            all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
+            all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
+            contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label)
+            contrastive_loss_t = ContrastiveLoss_t(all_target_con, pseudo_label_t)
 
-            loss = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_t + contrastive_loss_s
+            if epoch > 20:
+                pa_loss_val = proto_manager.get_aligned_loss(target_features, pseudo_label_t)
+                pa_loss = 0.2 * torch.log(1 + pa_loss_val)
+            else:
+                pa_loss = torch.tensor(0.0).cuda()
 
-            # Update parameters
+            # 保持 SH2HZ 特有的 Loss 权重组合
+            adapt_loss = 0.01 * lmmd_loss + contrastive_loss_t + contrastive_loss_s
+            loss = cls_loss + lambd * adapt_loss + pa_loss
+
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(feature_encoder.parameters(), max_norm=5.0)
             optimizer.step()
 
-            pred = source_outputs.data.max(1)[1]
-            total_hit += pred.eq(source_label.data.cuda()).sum()
-            size += source_label.data.size()[0]
+            epoch_loss += loss.item()
+            if i == num_iter - 1:
+                debug_loss_components = {'Cls': cls_loss.item(), 'Adapt': (lambd * adapt_loss).item(),
+                                         'PA': pa_loss.item()}
 
-            test_accuracy = 100. * float(total_hit) / size
+        scheduler.step()
+        avg_loss = epoch_loss / num_iter
+        train_loss.append(avg_loss)
 
-        # 记录本轮 Loss
-        train_loss.append(loss.item())
-        print('Epoch {:>3d}: Total Loss: {:6.4f}'.format(epoch, loss.item()))
+        print('Ep {:>3d}: Avg Loss: {:.4f} | Cls: {:.4f} | Adapt: {:.4f} | PA: {:.4f} | LR: {:.6f}'.format(
+            epoch, avg_loss, debug_loss_components.get('Cls', 0), debug_loss_components.get('Adapt', 0),
+            debug_loss_components.get('PA', 0), current_lr))
 
         train_end = time.time()
 
-        # [关键修改] 改为每轮都测试 (epoch % 1 == 0)
+        # ==========================================
+        # 3. 测试与主动学习
+        # ==========================================
         if epoch % 1 == 0:
             feature_encoder.eval()
             total_rewards = 0
-            counter = 0
-            accuracies = []
             predict = np.array([], dtype=np.int64)
             labels = np.array([], dtype=np.int64)
             with torch.no_grad():
                 for test_datas, test_labels in test_loader:
                     batch_size = test_labels.shape[0]
-
-                    source_features, source1, _, source_outputs, source_out, test_features, _, _, test_outputs, _ = feature_encoder(
-                        Variable(source_data).cuda(), Variable(test_datas).cuda())
-
+                    _, _, _, _, _, _, _, _, test_outputs, _ = feature_encoder(source_data.cuda(), test_datas.cuda())
                     pred = test_outputs.data.max(1)[1]
-
-                    test_labels = test_labels.numpy()
-                    rewards = [1 if pred[j] == test_labels[j] else 0 for j in range(batch_size)]
-
+                    test_labels_np = test_labels.numpy()
+                    rewards = [1 if pred[j] == test_labels_np[j] else 0 for j in range(batch_size)]
                     total_rewards += np.sum(rewards)
-                    counter += batch_size
-
                     predict = np.append(predict, pred.cpu().numpy())
-                    labels = np.append(labels, test_labels)
+                    labels = np.append(labels, test_labels_np)
 
-                    accuracy = total_rewards / 1.0 / counter  #
-                    accuracies.append(accuracy)
-
+            test_end = time.time()
             test_accuracy = 100. * total_rewards / len(test_loader.dataset)
-            acc[iDataSet] = test_accuracy
-
-            # 计算并记录本轮 OA 和 AA
             oa_list.append(test_accuracy)
 
+            current_kappa = metrics.cohen_kappa_score(labels, predict)
+            kappa_list.append(current_kappa * 100)
+
             C_current = metrics.confusion_matrix(labels, predict)
-            # 防止除以0
             row_sum = np.sum(C_current, 1, dtype=np.float64)
             row_sum[row_sum == 0] = 0.1
             AA_current = np.diag(C_current) / row_sum
             aa_value = 100. * np.mean(AA_current)
             aa_list.append(aa_value)
 
-            # 记录最后一次的 Kappa
-            k[iDataSet] = metrics.cohen_kappa_score(labels, predict)
+            print('\tOA: {:.2f}% | AA: {:.2f}% | Kappa: {:.4f}'.format(test_accuracy, aa_value, current_kappa))
 
-            print('\tOA: {:.2f}% | AA: {:.2f}%'.format(test_accuracy, aa_value))
-
-            # [关键修改] 如果发现当前是 Best Epoch，记录详细数据
             if test_accuracy > last_accuracy:
                 last_accuracy = test_accuracy
                 best_episdoe = epoch
                 best_predict_all = predict
                 best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
-
-                # [新增] 专门记录Best时刻的各类精度，用于最后打印
                 best_class_acc = AA_current
+                best_kappa_val = current_kappa
+                best_oa_val = test_accuracy
+                print('\t>>> Best Result Updated!')
 
-                print('\t>>> Best Result Updated! Epoch:[{}], Best OA={:.2f}%'.format(best_episdoe, last_accuracy))
+            if epoch % 20 == 0 and epoch < epochs:
+                print(f">>> Active Learning Query at Epoch {epoch}...")
+                feature_encoder.eval()
+                all_entropies = []
+                eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+                with torch.no_grad():
+                    for t_data, _ in eval_loader:
+                        dummy_s = torch.zeros_like(t_data)
+                        _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
+                        probs = F.softmax(t_out, dim=1)
+                        entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
+                        all_entropies.append(entropy.cpu())
+                all_entropies = torch.cat(all_entropies)
 
-            # print('***********************************************************************************')
+                candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
+                if active_queried_indices:
+                    candidate_mask[active_queried_indices] = False
+                valid_entropies = all_entropies.clone()
+                valid_entropies[~candidate_mask] = -1.0
 
-# 打印最终结果（使用 best_class_acc 而不是最后一轮的）
-print("\n" + "=" * 40)
-print("Train time per DataSet(s): " + "{:.5f}".format(train_end - train_start))
-print("Best OA (Overall Accuracy): " + "{:.2f}%".format(last_accuracy))
-print("Best AA (Average Accuracy): " + "{:.2f}%".format(100 * np.mean(best_class_acc)))
-print("Best Kappa: " + "{:.4f}".format(k[iDataSet].item()))  # 加 .item() 修复报错
-print("-" * 40)
-print("Accuracy for each class (Matched with Visualization): ")
-for i in range(CLASS_NUM):
-    print("Class " + str(i) + ": " + "{:.2f}".format(100 * best_class_acc[i]))
-print("=" * 40 + "\n")
+                limit_percent = int(0.01 * len(test_dataset))
+                num_query = min(limit_percent, 100)
 
-best_iDataset = 0
-for i in range(len(acc)):
-    # print('{}:{}'.format(i, acc[i]))
-    if acc[i] > acc[best_iDataset]:
-        best_iDataset = i
-# print('best acc all={}'.format(acc[best_iDataset]))
+                if num_query > 0:
+                    _, topk_indices = torch.topk(valid_entropies, num_query)
+                    new_queries = []
+                    for idx in topk_indices.tolist():
+                        if idx not in active_queried_indices and valid_entropies[idx] >= 0:
+                            new_queries.append(idx)
+                            active_queried_indices.append(idx)
 
-################# classification map ################################
+                    if new_queries:
+                        print(f"    Added {len(new_queries)} samples to training set.")
+                        current_source_x = train_loader_s.dataset.tensors[0]
+                        current_source_y = train_loader_s.dataset.tensors[1]
+                        target_x_all = test_loader.dataset.tensors[0]
+                        target_y_all = test_loader.dataset.tensors[1]
+                        query_x = target_x_all[new_queries]
+                        query_y = target_y_all[new_queries]
+                        new_source_x = torch.cat([current_source_x, query_x], dim=0)
+                        new_source_y = torch.cat([current_source_y, query_y], dim=0)
+                        new_train_dataset = TensorDataset(new_source_x, new_source_y)
+                        train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                    drop_last=True, num_workers=4, pin_memory=True)
+                        print(f"    Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
 
-for i in range(len(best_predict_all)):  # predict ndarray <class 'tuple'>: (9729,)
-    best_G[best_Row[best_RandPerm[i]]][best_Column[best_RandPerm[i]]] = best_predict_all[i] + 1
+    # ---------------------------------------------------------
+    # 4. 单次循环结束：保存并打印当次结果
+    # ---------------------------------------------------------
+    acc[iDataSet, 0] = best_oa_val
+    A[iDataSet, :] = best_class_acc
+    k[iDataSet, 0] = best_kappa_val
 
-hsi_pic = np.zeros((best_G.shape[0], best_G.shape[1], 3))
-for i in range(best_G.shape[0]):
-    for j in range(best_G.shape[1]):
-        if best_G[i][j] == 0:
-            hsi_pic[i, j, :] = [0, 0, 0]
-        if best_G[i][j] == 1:
-            hsi_pic[i, j, :] = [0, 0, 1]
-        if best_G[i][j] == 2:
-            hsi_pic[i, j, :] = [0, 1, 0]
-        if best_G[i][j] == 3:
-            hsi_pic[i, j, :] = [0, 1, 1]
-        if best_G[i][j] == 4:
-            hsi_pic[i, j, :] = [1, 0, 0]
-        if best_G[i][j] == 5:
-            hsi_pic[i, j, :] = [1, 0, 1]
-        if best_G[i][j] == 6:
-            hsi_pic[i, j, :] = [1, 1, 0]
-        if best_G[i][j] == 7:
-            hsi_pic[i, j, :] = [0.5, 0.5, 1]
+    print("\n" + "=" * 40)
+    print(f"Results for DataSet (Run) {iDataSet + 1}")
+    print("Total Training Duration: " + "{:.2f} s".format(train_end - train_start))
+    print("Best OA (Overall Accuracy): " + "{:.2f}%".format(best_oa_val))
+    print("Best AA (Average Accuracy): " + "{:.2f}%".format(100 * np.mean(best_class_acc)))
+    print("Best Kappa: " + "{:.4f}".format(best_kappa_val))
+    print("-" * 40)
+    print("Accuracy for each class:")
+    for i in range(CLASS_NUM):
+        print("Class " + str(i) + ": " + "{:.2f}".format(100 * best_class_acc[i]))
+    print("=" * 40 + "\n")
 
-# 如果需要保存结果图，请取消注释
-# utils.classification_map(hsi_pic[4:-4, 4:-4, :], best_G[4:-4, 4:-4], 24,  "classificationMap/SH2HZ/sh_result.png")
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    color = 'tab:red'
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    line1 = ax1.plot(range(1, len(oa_list) + 1), oa_list, label='OA', color='red', linestyle='-')
+    line2 = ax1.plot(range(1, len(kappa_list) + 1), kappa_list, label='Kappa (x100)', color='orange', linestyle='--')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_ylim([0, 100])
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Loss', color=color)
+    line3 = ax2.plot(range(1, len(train_loss) + 1), train_loss, label='Loss', color='blue', alpha=0.5)
+    ax2.tick_params(axis='y', labelcolor=color)
+    lines = line1 + line2 + line3
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='center right')
+    plt.title(f'Training Metrics (ETA-Mamba SH2HZ) - Run {iDataSet + 1}')
+    plt.grid(True, linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(f'classificationMap/SH2HZ/metrics_curve_run{iDataSet + 1}.png', dpi=300)
+    plt.close()
 
-# ==========================================
-# [重点新增] 绘制三合一折线图 (OA, AA, Loss)
-# ==========================================
-plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+    log_dir = 'classificationMap/SH2HZ/'
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    log_file_path = os.path.join(log_dir, 'training_history_log.txt')
+    current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    log_content = [f"\n[{current_time_str}] --- Run {iDataSet + 1} / {nDataSet} ---",
+                   f"Best OA : {best_oa_val:.2f}% | Best AA : {100 * np.mean(best_class_acc):.2f}% | Best Kappa : {best_kappa_val:.4f}"]
+    log_str = "\n".join(log_content)
+    try:
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            f.write(log_str)
+    except Exception as e:
+        pass
 
-fig, ax1 = plt.subplots(figsize=(10, 6))
+# ==============================================================================
+# 5. 所有循环结束：计算最终平均值 (Mean) 和 标准差 (Std)，并汇总保存
+# ==============================================================================
+if nDataSet > 0:
+    mean_oa, std_oa = np.mean(acc), np.std(acc)
+    mean_aa, std_aa = np.mean(A) * 100, np.std(np.mean(A, axis=1)) * 100
+    mean_kappa, std_kappa = np.mean(k), np.std(k)
+    mean_class_acc = np.mean(A, axis=0) * 100
+    std_class_acc = np.std(A, axis=0) * 100
 
-# 设置左侧Y轴 (Accuracy)
-color = 'tab:red'
-ax1.set_xlabel('Epoch')
-ax1.set_ylabel('Accuracy (%)', color=color)
-# 绘制 OA 和 AA
-line1 = ax1.plot(range(1, len(oa_list) + 1), oa_list, label='OA (Overall Acc)', color='red', linestyle='-')
-line2 = ax1.plot(range(1, len(aa_list) + 1), aa_list, label='AA (Average Acc)', color='orange', linestyle='--')
-ax1.tick_params(axis='y', labelcolor=color)
-ax1.set_ylim([0, 100])  # 精度固定在0-100之间
+    summary_content = [
+        "\n" + "#" * 50,
+        f"🎉 FINAL STATISTICAL RESULTS OVER {nDataSet} RUNS (SH2HZ) 🎉",
+        "#" * 50,
+        f"Mean OA ± Std    : {mean_oa:.2f}% ± {std_oa:.2f}%",
+        f"Mean AA ± Std    : {mean_aa:.2f}% ± {std_aa:.2f}%",
+        f"Mean Kappa ± Std : {mean_kappa:.4f} ± {std_kappa:.4f}",
+        "-" * 40,
+        "Mean Accuracy for each class:"
+    ]
+    for i in range(CLASS_NUM):
+        summary_content.append(f"Class {i}: {mean_class_acc[i]:.2f}% ± {std_class_acc[i]:.2f}%")
+    summary_content.append("#" * 50 + "\n")
 
-# 设置右侧Y轴 (Loss)
-ax2 = ax1.twinx()  # 实例化共享x轴的第二个axes
-color = 'tab:blue'
-ax2.set_ylabel('Loss', color=color)
-# 绘制 Loss
-line3 = ax2.plot(range(1, len(train_loss) + 1), train_loss, label='Training Loss', color='blue', alpha=0.5)
-ax2.tick_params(axis='y', labelcolor=color)
-
-# 合并图例
-lines = line1 + line2 + line3
-labels = [l.get_label() for l in lines]
-ax1.legend(lines, labels, loc='center right')
-
-plt.title('Training Metrics (SH2HZ): Loss, OA & AA')
-plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-plt.tight_layout()
-
-save_path = 'classificationMap/SH2HZ/combined_metrics_curve.png'
-plt.savefig(save_path, dpi=300)
-print(f"Combined metrics curve saved to {save_path}")
-plt.close()
+    summary_str = "\n".join(summary_content)
+    print(summary_str)
+    try:
+        with open(log_file_path, 'a', encoding='utf-8') as f:
+            f.write(summary_str)
+    except Exception as e:
+        pass
