@@ -285,7 +285,7 @@ for iDataSet in range(nDataSet):
 
                 print('\t>>> Best Result Updated!')
 
-            '''
+
             # Active Learning (全局熵策略)
             if epoch % 20 == 0 and epoch < epochs:
                 print(f">>> Active Learning Query at Epoch {epoch}...")
@@ -340,7 +340,7 @@ for iDataSet in range(nDataSet):
                                                     drop_last=True, num_workers=4, pin_memory=True)
 
                         print(f"    Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
-                        '''
+
     # ---------------------------------------------------------
     # 4. 单次循环结束：保存并打印当次结果
     # ---------------------------------------------------------
@@ -384,7 +384,7 @@ for iDataSet in range(nDataSet):
     plt.grid(True, linestyle='--', linewidth=0.5)
     plt.tight_layout()
     # 为不同组的实验保存不同的图片名，防止被覆盖
-    plt.savefig(f'classificationMap/Houston/100epoch Dataset5.png', dpi=300)
+    plt.savefig(f'classificationMap/Houston/100epoch Dataset5{iDataSet + 1}.png', dpi=300)
     plt.close()
 
     # 当次实验的日志记录

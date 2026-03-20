@@ -338,7 +338,7 @@ for iDataSet in range(nDataSet):
     plt.savefig(f'classificationMap/SH2HZ/metrics_curve_run{iDataSet + 1}.png', dpi=300)
     plt.close()
 
-    log_dir = 'classificationMap/SH2HZ/'
+    log_dir = 'classificationMap/SH2HZ/Active'
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     log_file_path = os.path.join(log_dir, 'training_history_log.txt')

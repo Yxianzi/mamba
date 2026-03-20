@@ -67,7 +67,7 @@ class DSANSS(nn.Module):
         super(DSANSS, self).__init__()
         self.n_outputs = 288
         self.feature_layers = DCRN_Mamba(n_band, patch_size, num_class)
-
+        self.dropout = nn.Dropout(p=0.5)
         self.fc1 = nn.Linear(288, num_class)
         self.fc2 = nn.Linear(288, 1)
         self.head1 = nn.Sequential(nn.Linear(288, 128))
@@ -82,6 +82,9 @@ class DSANSS(nn.Module):
         fea_x = self.fc1(features_x)
         output_x = self.fc2(features_x)
         output_x = self.sigmoid(output_x)
+
+        features_x = self.dropout(features_x)
+        features_y = self.dropout(features_y)
 
         y1 = F.normalize(self.head1(features_y), dim=1)
         y2 = F.normalize(self.head2(features_y), dim=1)
