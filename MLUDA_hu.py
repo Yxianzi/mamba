@@ -60,7 +60,8 @@ for iDataSet in range(nDataSet):
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
     testID, testX, testY, G, RandPerm, Row, Column = utils.get_all_data(data_t, label_t, HalfWidth)
 
-    train_dataset = TensorDataset(torch.from_numpy(trainX), torch.from_numpy(trainY).long())
+    source_domain_flags = torch.zeros(len(trainY), dtype=torch.int64)
+    train_dataset = TensorDataset(torch.from_numpy(trainX), torch.from_numpy(trainY).long(), source_domain_flags)
     test_dataset = TensorDataset(torch.from_numpy(testX), torch.from_numpy(testY).long())
 
     # 使用 pin_memory 加速数据传输
@@ -140,7 +141,7 @@ for iDataSet in range(nDataSet):
 
         for i in range(1, num_iter):
             try:
-                source_data, source_label = next(iter_source)
+                source_data, source_label, source_domain = next(iter_source)
             except StopIteration:
                 iter_source = iter(train_loader_s)
                 source_data, source_label = next(iter_source)
@@ -186,9 +187,19 @@ for iDataSet in range(nDataSet):
             p = (epoch - 1) / epochs
             lambd = 2 / (1 + math.exp(-10 * p)) - 1
 
-            lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
-                                 torch.nn.functional.softmax(target_outputs, dim=1),
-                                 BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
+            pure_source_mask = (source_domain == 0)
+            if pure_source_mask.sum() > 2:  # 确保有足够的样本计算分布
+                pure_source_features = source_features[pure_source_mask]
+                pure_source_labels = source_label[pure_source_mask]
+
+                # 动态计算当前纯源域的 batch size
+                pure_batch_size = pure_source_mask.sum().item()
+
+                lmmd_loss = mmd.lmmd(pure_source_features, target_features, pure_source_labels.cuda(),
+                                     torch.nn.functional.softmax(target_outputs, dim=1),
+                                     BATCH_SIZE=pure_batch_size, CLASS_NUM=CLASS_NUM)
+            else:
+                lmmd_loss = torch.tensor(0.0).cuda()
 
             all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
             all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
@@ -314,8 +325,6 @@ for iDataSet in range(nDataSet):
 
                 # 掩码初始化：排除已采样的样本
                 candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
-                if active_queried_indices:
-                    candidate_mask[active_queried_indices] = False
 
                 limit_percent = int(0.01 * len(test_dataset))
                 num_query = min(limit_percent, 100)
@@ -359,31 +368,33 @@ for iDataSet in range(nDataSet):
                             _, fallback_idx = torch.topk(fallback_entropies, actual_shortage)
                             new_queries.extend(fallback_idx.tolist())
 
-
-                    # 4. 更新数据集 【核心漏洞修复：防止数据泄露】
+                            # 4. 更新数据集 【核心修复：防数据泄露 & 标记目标域样本】
                     if new_queries:
                         print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
 
-                        # 获取当前的测试/目标集全体数据
+                        # 获取当前 Loader 中的数据
+                        current_source_x = train_loader_s.dataset.tensors[0]
+                        current_source_y = train_loader_s.dataset.tensors[1]
+                        current_source_d = train_loader_s.dataset.tensors[2]  # 获取现有的域标签
+
                         target_x_all = test_loader.dataset.tensors[0]
                         target_y_all = test_loader.dataset.tensors[1]
 
                         # 抽取查询到的数据
                         query_x = target_x_all[new_queries]
                         query_y = target_y_all[new_queries]
+                        query_d = torch.ones(len(query_y), dtype=torch.int64)  # 【打上目标域标记 1】
 
-                        # 1. 将查询数据合并到源域训练集
-                        current_source_x = train_loader_s.dataset.tensors[0]
-                        current_source_y = train_loader_s.dataset.tensors[1]
-
+                        # 1. 扩充源域 Loader (带标记)
                         new_source_x = torch.cat([current_source_x, query_x], dim=0)
                         new_source_y = torch.cat([current_source_y, query_y], dim=0)
+                        new_source_d = torch.cat([current_source_d, query_d], dim=0)
 
-                        train_dataset = TensorDataset(new_source_x, new_source_y)
-                        train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                        new_train_dataset = TensorDataset(new_source_x, new_source_y, new_source_d)
+                        train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                                                     drop_last=True, num_workers=4, pin_memory=True)
 
-                        # 2. 从测试集/目标域中【永久剔除】这些已泄露标签的样本
+                        # 2. 从测试集/无监督目标域中【永久剔除】已查询样本，彻底杜绝数据泄露
                         keep_mask = torch.ones(len(target_y_all), dtype=torch.bool)
                         keep_mask[new_queries] = False
 
@@ -392,16 +403,18 @@ for iDataSet in range(nDataSet):
 
                         test_dataset = TensorDataset(new_test_x, new_test_y)
 
-                        # 更新评估用的 test_loader
+                        # 重新生成测试集和目标域Loader
                         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
                                                  drop_last=True)
-                        # 更新无监督对齐用的 train_loader_t (防止源域混合了Target后，又和同样的Target对齐)
                         train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True,
                                                     drop_last=True, num_workers=4, pin_memory=True)
 
-                        print(
-                            f"    Dataset updated: Train Size {len(current_source_y)} -> {len(new_source_y)} | Test Size {len(target_y_all)} -> {len(new_test_y)}")
+                        # 同步更新外部的动态长度
+                        len_source_loader = len(train_loader_s)
+                        len_target_loader = len(train_loader_t)
 
+                        print(
+                            f"    Dataset updated: Source_Loader Size -> {len(new_source_y)} | Test_Loader Size -> {len(new_test_y)}")
     # ---------------------------------------------------------
     # 4. 单次循环结束：保存并打印当次结果
     # ---------------------------------------------------------
