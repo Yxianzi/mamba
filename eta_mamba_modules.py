@@ -1,9 +1,9 @@
 # eta_mamba_modules.py
 import torch
 import torch.nn as nn
-from mamba_ssm import Mamba # 需安装 mamba-ssm
+from mamba_ssm import Mamba
 
-# 创新点一：双向空间-光谱 Mamba (Bi-SSM)
+
 class BiSSMBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -12,49 +12,64 @@ class BiSSMBlock(nn.Module):
         self.proj = nn.Linear(d_model * 2, d_model)
 
     def forward(self, x):
-        # x shape: (B, L, D) -> L 为波段*空间序列长度
         out_f = self.forward_mamba(x)
         out_b = self.backward_mamba(x.flip(dims=[1])).flip(dims=[1])
         out = torch.cat([out_f, out_b], dim=-1)
         return self.proj(out)
 
-# 创新点二：时序动量原型管理器
-class TemporalPrototypeManager(nn.Module):  # 继承 nn.Module 以便管理参数
+
+class TemporalPrototypeManager(nn.Module):
     def __init__(self, class_num, feature_dim, momentum=0.9):
         super().__init__()
         self.class_num = class_num
         self.momentum = momentum
-        # 源域原型 (不参与梯度更新，由动量更新)
-        self.register_buffer('prototypes', torch.zeros(class_num, feature_dim))
 
-        # [关键修改] 季节性演进向量改为“可学习参数”
-        # 初始化为微小的随机值，让网络自己去学偏移量
+        self.register_buffer('prototypes', torch.zeros(class_num, feature_dim))
+        # 【修复】：新增全局目标域原型，消除 Batch Size 过小带来的方差震荡
+        self.register_buffer('target_prototypes', torch.zeros(class_num, feature_dim))
+
         self.delta_phi = nn.Parameter(torch.randn(class_num, feature_dim) * 0.01)
 
     def update(self, features, labels):
-        # 保持动量更新逻辑不变
         with torch.no_grad():
             for i in range(self.class_num):
                 mask = (labels == i)
                 if mask.sum() > 0:
                     feat_mean = features[mask].mean(0)
-                    # 第一次更新时直接赋值
                     if self.prototypes[i].sum() == 0:
                         self.prototypes[i] = feat_mean
                     else:
                         self.prototypes[i] = self.momentum * self.prototypes[i] + (1 - self.momentum) * feat_mean
 
-    def get_aligned_loss(self, t_features, t_pseudo_labels):
+    # 【新增】：更新高置信度的目标域原型
+    def update_target(self, t_features, t_pseudo_labels):
+        with torch.no_grad():
+            for i in range(self.class_num):
+                mask = (t_pseudo_labels == i)
+                if mask.sum() > 0:
+                    feat_mean = t_features[mask].mean(0)
+                    if self.target_prototypes[i].sum() == 0:
+                        self.target_prototypes[i] = feat_mean
+                    else:
+                        self.target_prototypes[i] = self.momentum * self.target_prototypes[i] + (
+                                    1 - self.momentum) * feat_mean
+
+    # 【修复】：引入物理正则化，不再依赖不稳定且有噪声的 Batch Feature
+    def get_aligned_loss(self):
         loss = 0
         count = 0
-        # 确保 delta_phi 参与计算图
         for i in range(self.class_num):
-            mask = (t_pseudo_labels == i)
-            if mask.sum() > 0:
-                t_mean = t_features[mask].mean(0)
-                # 公式：Target中心 应该接近 (Source中心 + 学习到的物理偏移)
-                # 这里 delta_phi 会根据 loss 自动优化
+            # 只有当源域和目标域该类别的原型都存在时才进行对齐
+            if self.target_prototypes[i].sum() != 0 and self.prototypes[i].sum() != 0:
                 target_aligned = self.prototypes[i] + self.delta_phi[i]
-                loss += torch.norm(t_mean - target_aligned, p=2)
+
+                # 1. 宏观对齐误差
+                align_error = torch.norm(self.target_prototypes[i] - target_aligned, p=2)
+
+                # 2. 【核心修复】：物理偏移正则化 (L2 Penalty)，强制 delta_phi 保持微小，防止吸收所有域差异
+                reg_penalty = 0.5 * torch.norm(self.delta_phi[i], p=2)
+
+                loss += (align_error + reg_penalty)
                 count += 1
+
         return loss / count if count > 0 else torch.tensor(0.0).cuda()

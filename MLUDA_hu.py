@@ -1,8 +1,3 @@
-# -*- coding:utf-8 -*-
-# Author：Mingshuo Cai
-# Usage：Implementation of the MLUDA method on the Houston cross-domain dataset
-# Modified: ETA-Mamba Version (Deep Hybrid + Active Learning + Physical Alignment + Multi-run Stats)
-
 import matplotlib.pyplot as plt
 import math
 import torch
@@ -94,7 +89,7 @@ for iDataSet in range(nDataSet):
         {'params': feature_encoder.fc2.parameters(), 'lr': lr},
         {'params': feature_encoder.head1.parameters(), 'lr': lr},
         {'params': feature_encoder.head2.parameters(), 'lr': lr},
-        {'params': proto_manager.parameters(), 'lr': 1e-2}
+        {'params': proto_manager.parameters(), 'lr': 1e-3}
     ], lr=5e-4, weight_decay=1e-4, eps=1e-8)
 
 
@@ -136,9 +131,11 @@ for iDataSet in range(nDataSet):
 
         iter_source = iter(train_loader_s)
         iter_target = iter(train_loader_t)
-        num_iter = len_source_loader
-        epoch_loss = 0.0
 
+        num_iter = len(train_loader_s)
+        len_target_loader = len(train_loader_t)
+
+        epoch_loss = 0.0
         debug_loss_components = {}
 
         for i in range(1, num_iter):
@@ -168,10 +165,14 @@ for iDataSet in range(nDataSet):
                                                                                         target_data.cuda())
 
             softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
-            _, pseudo_label_t = torch.max(softmax_output_t, 1)
+            max_probs_t, pseudo_label_t = torch.max(softmax_output_t, 1)
+            conf_mask = max_probs_t > 0.8
 
             # Update Prototypes
             proto_manager.update(source_features.detach(), source_label.cuda())
+
+            if conf_mask.sum() > 0:
+                proto_manager.update_target(target_features.detach()[conf_mask], pseudo_label_t[conf_mask])
 
             # Augmented Forward
             (_, source2, _, source_outputs2, _, _, _, target2, t1, _) = feature_encoder(source_data0.cuda(),
@@ -192,13 +193,17 @@ for iDataSet in range(nDataSet):
             all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
             all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
             contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label)
-            contrastive_loss_t = ContrastiveLoss_t(all_target_con, pseudo_label_t)
+            # 修改对比损失：只对高置信度样本计算
+            if conf_mask.sum() > 2:
+                contrastive_loss_t = ContrastiveLoss_t(all_target_con[conf_mask], pseudo_label_t[conf_mask])
+            else:
+                contrastive_loss_t = torch.tensor(0.0).cuda()
 
             domain_similar_loss = DSH_loss(source_out, target_out)
 
-            # PA Loss
+            # 修改 PA Loss：同样只用高置信度样本对齐
             if epoch > 20:
-                pa_loss_val = proto_manager.get_aligned_loss(target_features, pseudo_label_t)
+                pa_loss_val = proto_manager.get_aligned_loss()
                 pa_loss = 0.2 * torch.log(1 + pa_loss_val)
             else:
                 pa_loss = torch.tensor(0.0).cuda()
@@ -354,29 +359,48 @@ for iDataSet in range(nDataSet):
                             _, fallback_idx = torch.topk(fallback_entropies, actual_shortage)
                             new_queries.extend(fallback_idx.tolist())
 
-                    # 4. 更新数据集
-                    if new_queries:
-                        for idx in new_queries:
-                            active_queried_indices.append(idx)
 
+                    # 4. 更新数据集 【核心漏洞修复：防止数据泄露】
+                    if new_queries:
                         print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
 
-                        current_source_x = train_loader_s.dataset.tensors[0]
-                        current_source_y = train_loader_s.dataset.tensors[1]
+                        # 获取当前的测试/目标集全体数据
                         target_x_all = test_loader.dataset.tensors[0]
                         target_y_all = test_loader.dataset.tensors[1]
 
+                        # 抽取查询到的数据
                         query_x = target_x_all[new_queries]
                         query_y = target_y_all[new_queries]
+
+                        # 1. 将查询数据合并到源域训练集
+                        current_source_x = train_loader_s.dataset.tensors[0]
+                        current_source_y = train_loader_s.dataset.tensors[1]
 
                         new_source_x = torch.cat([current_source_x, query_x], dim=0)
                         new_source_y = torch.cat([current_source_y, query_y], dim=0)
 
-                        new_train_dataset = TensorDataset(new_source_x, new_source_y)
-                        train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                        train_dataset = TensorDataset(new_source_x, new_source_y)
+                        train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                                                     drop_last=True, num_workers=4, pin_memory=True)
 
-                        print(f"    Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
+                        # 2. 从测试集/目标域中【永久剔除】这些已泄露标签的样本
+                        keep_mask = torch.ones(len(target_y_all), dtype=torch.bool)
+                        keep_mask[new_queries] = False
+
+                        new_test_x = target_x_all[keep_mask]
+                        new_test_y = target_y_all[keep_mask]
+
+                        test_dataset = TensorDataset(new_test_x, new_test_y)
+
+                        # 更新评估用的 test_loader
+                        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                                 drop_last=True)
+                        # 更新无监督对齐用的 train_loader_t (防止源域混合了Target后，又和同样的Target对齐)
+                        train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                    drop_last=True, num_workers=4, pin_memory=True)
+
+                        print(
+                            f"    Dataset updated: Train Size {len(current_source_y)} -> {len(new_source_y)} | Test Size {len(target_y_all)} -> {len(new_test_y)}")
 
     # ---------------------------------------------------------
     # 4. 单次循环结束：保存并打印当次结果
@@ -421,11 +445,11 @@ for iDataSet in range(nDataSet):
     plt.grid(True, linestyle='--', linewidth=0.5)
     plt.tight_layout()
     # 为不同组的实验保存不同的图片名，防止被覆盖
-    plt.savefig(f'classificationMap/Houston/100epoch Dataset5{iDataSet + 1}.png', dpi=300)
+    plt.savefig(f'classificationMap/Houston/Active/new1/100epoch Dataset5{iDataSet + 1}.png', dpi=300)
     plt.close()
 
     # 当次实验的日志记录
-    log_dir = 'classificationMap/Houston/'
+    log_dir = 'classificationMap/Houston/Active/new1'
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     log_file_path = os.path.join(log_dir, '100epoch Dataset5.txt')
