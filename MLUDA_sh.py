@@ -35,7 +35,7 @@ data_s, data_t, label_s, label_t = utils.cubeData(file_path)
 data_s, data_t = ILDA(data_s, data_t, pca_n, radius)
 
 # Loss Function
-crossEntropy = nn.CrossEntropyLoss().cuda()
+crossEntropy = nn.CrossEntropyLoss(label_smoothing=0.1).cuda()
 ContrastiveLoss_s = SupConLoss(temperature=0.1).cuda()
 ContrastiveLoss_t = SupConLoss(temperature=0.1).cuda()
 DSH_loss = utils.Domain_Occ_loss().cuda()
@@ -250,154 +250,154 @@ for iDataSet in range(nDataSet):
                 print('\t>>> Best Result Updated!')
 
                 # Active Learning (分层类别感知熵策略)
-                if epoch % 20 == 0 and epoch < epochs:
-                    print(f">>> Active Learning Query at Epoch {epoch}...")
-                    feature_encoder.eval()
-                    all_entropies = []
-                    all_preds = []  # [新增] 必须同时记录预测类别用于分层
+            if epoch % 20 == 0 and epoch < epochs:
+                print(f">>> Active Learning Query at Epoch {epoch}...")
+                feature_encoder.eval()
+                all_entropies = []
+                all_preds = []  # [新增] 必须同时记录预测类别用于分层
 
-                    eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-                    with torch.no_grad():
-                        for t_data, _ in eval_loader:
-                            dummy_s = torch.zeros_like(t_data)
-                            _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
-                            probs = F.softmax(t_out, dim=1)
-                            entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
-                            preds = torch.argmax(probs, dim=1)
+                eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+                with torch.no_grad():
+                    for t_data, _ in eval_loader:
+                        dummy_s = torch.zeros_like(t_data)
+                        _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
+                        probs = F.softmax(t_out, dim=1)
+                        entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
+                        preds = torch.argmax(probs, dim=1)
 
-                            all_entropies.append(entropy.cpu())
-                            all_preds.append(preds.cpu())
+                        all_entropies.append(entropy.cpu())
+                        all_preds.append(preds.cpu())
 
-                    all_entropies = torch.cat(all_entropies)
-                    all_preds = torch.cat(all_preds)
+                all_entropies = torch.cat(all_entropies)
+                all_preds = torch.cat(all_preds)
 
-                    # 掩码初始化：排除已采样的样本
-                    candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
-                    if active_queried_indices:
-                        candidate_mask[active_queried_indices] = False
+                # 掩码初始化：排除已采样的样本
+                candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
+                if active_queried_indices:
+                    candidate_mask[active_queried_indices] = False
 
-                    limit_percent = int(0.01 * len(test_dataset))
-                    num_query = min(limit_percent, 100)
+                limit_percent = int(0.01 * len(test_dataset))
+                num_query = min(limit_percent, 100)
 
-                    if num_query > 0:
-                        new_queries = []
-                        # 1. 计算每个类别的基础配额
-                        query_num_per_class = num_query // CLASS_NUM
-                        remainder = num_query % CLASS_NUM
+                if num_query > 0:
+                    new_queries = []
+                    # 1. 计算每个类别的基础配额
+                    query_num_per_class = num_query // CLASS_NUM
+                    remainder = num_query % CLASS_NUM
 
-                        # 2. 按类别进行独立分层采样
-                        for c in range(CLASS_NUM):
-                            # 提取当前类别且未被采样的样本掩码
-                            class_mask = (all_preds == c) & candidate_mask
+                    # 2. 按类别进行独立分层采样
+                    for c in range(CLASS_NUM):
+                        # 提取当前类别且未被采样的样本掩码
+                        class_mask = (all_preds == c) & candidate_mask
 
-                            if class_mask.sum() > 0:
-                                class_entropies = all_entropies.clone()
-                                # 屏蔽非当前类别的样本
-                                class_entropies[~class_mask] = -1.0
+                        if class_mask.sum() > 0:
+                            class_entropies = all_entropies.clone()
+                            # 屏蔽非当前类别的样本
+                            class_entropies[~class_mask] = -1.0
 
-                                # 将余数配额分配给前几个类，确保总数严格等于 num_query
-                                quota = query_num_per_class + (1 if c < remainder else 0)
-                                actual_k = min(quota, class_mask.sum().item())
+                            # 将余数配额分配给前几个类，确保总数严格等于 num_query
+                            quota = query_num_per_class + (1 if c < remainder else 0)
+                            actual_k = min(quota, class_mask.sum().item())
 
-                                if actual_k > 0:
-                                    _, topk_idx = torch.topk(class_entropies, actual_k)
-                                    new_queries.extend(topk_idx.tolist())
+                            if actual_k > 0:
+                                _, topk_idx = torch.topk(class_entropies, actual_k)
+                                new_queries.extend(topk_idx.tolist())
 
-                        # 3. 极端回退机制：如果某些类被预测的次数少于配额，导致整体采样不足
-                        # 则用剩余样本中的全局最高熵来补齐差额
-                        if len(new_queries) < num_query:
-                            shortage = num_query - len(new_queries)
-                            remaining_mask = candidate_mask.clone()
-                            remaining_mask[new_queries] = False  # 排除刚才分层已选的
+                    # 3. 极端回退机制：如果某些类被预测的次数少于配额，导致整体采样不足
+                    # 则用剩余样本中的全局最高熵来补齐差额
+                    if len(new_queries) < num_query:
+                        shortage = num_query - len(new_queries)
+                        remaining_mask = candidate_mask.clone()
+                        remaining_mask[new_queries] = False  # 排除刚才分层已选的
 
-                            fallback_entropies = all_entropies.clone()
-                            fallback_entropies[~remaining_mask] = -1.0
+                        fallback_entropies = all_entropies.clone()
+                        fallback_entropies[~remaining_mask] = -1.0
 
-                            actual_shortage = min(shortage, remaining_mask.sum().item())
-                            if actual_shortage > 0:
-                                _, fallback_idx = torch.topk(fallback_entropies, actual_shortage)
-                                new_queries.extend(fallback_idx.tolist())
+                        actual_shortage = min(shortage, remaining_mask.sum().item())
+                        if actual_shortage > 0:
+                            _, fallback_idx = torch.topk(fallback_entropies, actual_shortage)
+                            new_queries.extend(fallback_idx.tolist())
 
-                        # 4. 更新数据集
-                        if new_queries:
-                            for idx in new_queries:
-                                active_queried_indices.append(idx)
+                    # 4. 更新数据集
+                    if new_queries:
+                        for idx in new_queries:
+                            active_queried_indices.append(idx)
 
-                            print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
+                        print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
 
-                            current_source_x = train_loader_s.dataset.tensors[0]
-                            current_source_y = train_loader_s.dataset.tensors[1]
-                            target_x_all = test_loader.dataset.tensors[0]
-                            target_y_all = test_loader.dataset.tensors[1]
+                        current_source_x = train_loader_s.dataset.tensors[0]
+                        current_source_y = train_loader_s.dataset.tensors[1]
+                        target_x_all = test_loader.dataset.tensors[0]
+                        target_y_all = test_loader.dataset.tensors[1]
 
-                            query_x = target_x_all[new_queries]
-                            query_y = target_y_all[new_queries]
+                        query_x = target_x_all[new_queries]
+                        query_y = target_y_all[new_queries]
 
-                            new_source_x = torch.cat([current_source_x, query_x], dim=0)
-                            new_source_y = torch.cat([current_source_y, query_y], dim=0)
+                        new_source_x = torch.cat([current_source_x, query_x], dim=0)
+                        new_source_y = torch.cat([current_source_y, query_y], dim=0)
 
-                            new_train_dataset = TensorDataset(new_source_x, new_source_y)
-                            train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                                        drop_last=True, num_workers=4, pin_memory=True)
+                        new_train_dataset = TensorDataset(new_source_x, new_source_y)
+                        train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                    drop_last=True, num_workers=4, pin_memory=True)
 
-                            print(f"    Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
+                        print(f"    Dataset updated: {len(current_source_y)} -> {len(new_source_y)}")
 
-    # ---------------------------------------------------------
-    # 4. 单次循环结束：保存并打印当次结果
-    # ---------------------------------------------------------
-    acc[iDataSet, 0] = best_oa_val
-    A[iDataSet, :] = best_class_acc
-    k[iDataSet, 0] = best_kappa_val
+# ---------------------------------------------------------
+# 4. 单次循环结束：保存并打印当次结果
+# ---------------------------------------------------------
+acc[iDataSet, 0] = best_oa_val
+A[iDataSet, :] = best_class_acc
+k[iDataSet, 0] = best_kappa_val
 
-    print("\n" + "=" * 40)
-    print(f"Results for DataSet (Run) {iDataSet + 1}")
-    print("Total Training Duration: " + "{:.2f} s".format(train_end - train_start))
-    print("Best OA (Overall Accuracy): " + "{:.2f}%".format(best_oa_val))
-    print("Best AA (Average Accuracy): " + "{:.2f}%".format(100 * np.mean(best_class_acc)))
-    print("Best Kappa: " + "{:.4f}".format(best_kappa_val))
-    print("-" * 40)
-    print("Accuracy for each class:")
-    for i in range(CLASS_NUM):
-        print("Class " + str(i) + ": " + "{:.2f}".format(100 * best_class_acc[i]))
-    print("=" * 40 + "\n")
+print("\n" + "=" * 40)
+print(f"Results for DataSet (Run) {iDataSet + 1}")
+print("Total Training Duration: " + "{:.2f} s".format(train_end - train_start))
+print("Best OA (Overall Accuracy): " + "{:.2f}%".format(best_oa_val))
+print("Best AA (Average Accuracy): " + "{:.2f}%".format(100 * np.mean(best_class_acc)))
+print("Best Kappa: " + "{:.4f}".format(best_kappa_val))
+print("-" * 40)
+print("Accuracy for each class:")
+for i in range(CLASS_NUM):
+    print("Class " + str(i) + ": " + "{:.2f}".format(100 * best_class_acc[i]))
+print("=" * 40 + "\n")
 
-    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-    plt.rcParams['axes.unicode_minus'] = False
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    color = 'tab:red'
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Accuracy (%)', color=color)
-    line1 = ax1.plot(range(1, len(oa_list) + 1), oa_list, label='OA', color='red', linestyle='-')
-    line2 = ax1.plot(range(1, len(kappa_list) + 1), kappa_list, label='Kappa (x100)', color='orange', linestyle='--')
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_ylim([0, 100])
-    ax2 = ax1.twinx()
-    color = 'tab:blue'
-    ax2.set_ylabel('Loss', color=color)
-    line3 = ax2.plot(range(1, len(train_loss) + 1), train_loss, label='Loss', color='blue', alpha=0.5)
-    ax2.tick_params(axis='y', labelcolor=color)
-    lines = line1 + line2 + line3
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='center right')
-    plt.title(f'Training Metrics (ETA-Mamba SH2HZ) - Run {iDataSet + 1}')
-    plt.grid(True, linestyle='--', linewidth=0.5)
-    plt.tight_layout()
-    plt.savefig(f'classificationMap/SH2HZ/metrics_curve_run{iDataSet + 1}.png', dpi=300)
-    plt.close()
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+fig, ax1 = plt.subplots(figsize=(10, 6))
+color = 'tab:red'
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Accuracy (%)', color=color)
+line1 = ax1.plot(range(1, len(oa_list) + 1), oa_list, label='OA', color='red', linestyle='-')
+line2 = ax1.plot(range(1, len(kappa_list) + 1), kappa_list, label='Kappa (x100)', color='orange', linestyle='--')
+ax1.tick_params(axis='y', labelcolor=color)
+ax1.set_ylim([0, 100])
+ax2 = ax1.twinx()
+color = 'tab:blue'
+ax2.set_ylabel('Loss', color=color)
+line3 = ax2.plot(range(1, len(train_loss) + 1), train_loss, label='Loss', color='blue', alpha=0.5)
+ax2.tick_params(axis='y', labelcolor=color)
+lines = line1 + line2 + line3
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc='center right')
+plt.title(f'Training Metrics (ETA-Mamba SH2HZ) - Run {iDataSet + 1}')
+plt.grid(True, linestyle='--', linewidth=0.5)
+plt.tight_layout()
+plt.savefig(f'classificationMap/SH2HZ/metrics_curve_run{iDataSet + 1}.png', dpi=300)
+plt.close()
 
-    log_dir = 'classificationMap/SH2HZ/Active'
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    log_file_path = os.path.join(log_dir, 'training_history_log.txt')
-    current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    log_content = [f"\n[{current_time_str}] --- Run {iDataSet + 1} / {nDataSet} ---",
-                   f"Best OA : {best_oa_val:.2f}% | Best AA : {100 * np.mean(best_class_acc):.2f}% | Best Kappa : {best_kappa_val:.4f}"]
-    log_str = "\n".join(log_content)
-    try:
-        with open(log_file_path, 'a', encoding='utf-8') as f:
-            f.write(log_str)
-    except Exception as e:
-        pass
+log_dir = 'classificationMap/SH2HZ'
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+log_file_path = os.path.join(log_dir, 'training_history_test.txt')
+current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+log_content = [f"\n[{current_time_str}] --- Run {iDataSet + 1} / {nDataSet} ---",
+               f"Best OA : {best_oa_val:.2f}% | Best AA : {100 * np.mean(best_class_acc):.2f}% | Best Kappa : {best_kappa_val:.4f}"]
+log_str = "\n".join(log_content)
+try:
+    with open(log_file_path, 'a', encoding='utf-8') as f:
+        f.write(log_str)
+except Exception as e:
+    pass
 
 # ==============================================================================
 # 5. 所有循环结束：计算最终平均值 (Mean) 和 标准差 (Std)，并汇总保存

@@ -40,7 +40,7 @@ data_t, label_t = utils.load_data_houston(data_path_t, label_path_t)
 data_s, data_t = ILDA(data_s, data_t, pca_n, radius)
 
 # Loss Function
-crossEntropy = nn.CrossEntropyLoss().cuda()
+crossEntropy = nn.CrossEntropyLoss(label_smoothing=0.1).cuda()
 ContrastiveLoss_s = SupConLoss(temperature=0.1).cuda()
 ContrastiveLoss_t = SupConLoss(temperature=0.1).cuda()
 DSH_loss = utils.Domain_Occ_loss().cuda()
@@ -285,12 +285,12 @@ for iDataSet in range(nDataSet):
 
                 print('\t>>> Best Result Updated!')
 
-
-            # Active Learning (全局熵策略)
+            # Active Learning (分层类别感知熵策略)
             if epoch % 20 == 0 and epoch < epochs:
                 print(f">>> Active Learning Query at Epoch {epoch}...")
                 feature_encoder.eval()
                 all_entropies = []
+                all_preds = []  # [新增] 必须同时记录预测类别用于分层
 
                 eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
                 with torch.no_grad():
@@ -299,30 +299,67 @@ for iDataSet in range(nDataSet):
                         _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
                         probs = F.softmax(t_out, dim=1)
                         entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
-                        all_entropies.append(entropy.cpu())
-                all_entropies = torch.cat(all_entropies)
+                        preds = torch.argmax(probs, dim=1)
 
+                        all_entropies.append(entropy.cpu())
+                        all_preds.append(preds.cpu())
+
+                all_entropies = torch.cat(all_entropies)
+                all_preds = torch.cat(all_preds)
+
+                # 掩码初始化：排除已采样的样本
                 candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
                 if active_queried_indices:
                     candidate_mask[active_queried_indices] = False
-
-                valid_entropies = all_entropies.clone()
-                valid_entropies[~candidate_mask] = -1.0
 
                 limit_percent = int(0.01 * len(test_dataset))
                 num_query = min(limit_percent, 100)
 
                 if num_query > 0:
-                    _, topk_indices = torch.topk(valid_entropies, num_query)
-
                     new_queries = []
-                    for idx in topk_indices.tolist():
-                        if idx not in active_queried_indices and valid_entropies[idx] >= 0:
-                            new_queries.append(idx)
+                    # 1. 计算每个类别的基础配额
+                    query_num_per_class = num_query // CLASS_NUM
+                    remainder = num_query % CLASS_NUM
+
+                    # 2. 按类别进行独立分层采样
+                    for c in range(CLASS_NUM):
+                        # 提取当前类别且未被采样的样本掩码
+                        class_mask = (all_preds == c) & candidate_mask
+
+                        if class_mask.sum() > 0:
+                            class_entropies = all_entropies.clone()
+                            # 屏蔽非当前类别的样本
+                            class_entropies[~class_mask] = -1.0
+
+                            # 将余数配额分配给前几个类，确保总数严格等于 num_query
+                            quota = query_num_per_class + (1 if c < remainder else 0)
+                            actual_k = min(quota, class_mask.sum().item())
+
+                            if actual_k > 0:
+                                _, topk_idx = torch.topk(class_entropies, actual_k)
+                                new_queries.extend(topk_idx.tolist())
+
+                    # 3. 极端回退机制：如果某些类被预测的次数少于配额，导致整体采样不足
+                    # 则用剩余样本中的全局最高熵来补齐差额
+                    if len(new_queries) < num_query:
+                        shortage = num_query - len(new_queries)
+                        remaining_mask = candidate_mask.clone()
+                        remaining_mask[new_queries] = False  # 排除刚才分层已选的
+
+                        fallback_entropies = all_entropies.clone()
+                        fallback_entropies[~remaining_mask] = -1.0
+
+                        actual_shortage = min(shortage, remaining_mask.sum().item())
+                        if actual_shortage > 0:
+                            _, fallback_idx = torch.topk(fallback_entropies, actual_shortage)
+                            new_queries.extend(fallback_idx.tolist())
+
+                    # 4. 更新数据集
+                    if new_queries:
+                        for idx in new_queries:
                             active_queried_indices.append(idx)
 
-                    if new_queries:
-                        print(f"    Added {len(new_queries)} samples to training set.")
+                        print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
 
                         current_source_x = train_loader_s.dataset.tensors[0]
                         current_source_y = train_loader_s.dataset.tensors[1]
