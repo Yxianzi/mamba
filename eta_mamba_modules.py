@@ -52,7 +52,7 @@ class TemporalPrototypeManager(nn.Module):
                         self.target_prototypes[i] = feat_mean
                     else:
                         self.target_prototypes[i] = self.momentum * self.target_prototypes[i] + (
-                                    1 - self.momentum) * feat_mean
+                                1 - self.momentum) * feat_mean
 
     # 【修复】：引入物理正则化，不再依赖不稳定且有噪声的 Batch Feature
     def get_aligned_loss(self):
@@ -73,3 +73,16 @@ class TemporalPrototypeManager(nn.Module):
                 count += 1
 
         return loss / count if count > 0 else torch.tensor(0.0).cuda()
+
+        # 【新增创新点】：物理先验初始化
+
+    def init_physical_shift_prior(self, source_global_mean, target_global_mean):
+        """
+        在训练初期（如第1个Epoch结束时），利用源域和目标域的全局特征统计差异
+        作为物理偏移的初始物理先验。
+        """
+        with torch.no_grad():
+            global_shift = target_global_mean - source_global_mean
+            # 将全局物理偏移作为所有类别的初始漂移基准
+            for i in range(self.class_num):
+                self.delta_phi[i].data.copy_(global_shift * 0.1)  # 0.1为缩放因子，防止初始步子太大

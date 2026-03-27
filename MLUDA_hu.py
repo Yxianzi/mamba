@@ -243,6 +243,14 @@ for iDataSet in range(nDataSet):
 
         scheduler.step()
 
+        if epoch == 1:
+            # 取当前 epoch 最后一个 batch 的特征中心作为全局分布的近似估计
+            source_global = source_features.detach().mean(0)
+            target_global = target_features.detach().mean(0)
+            proto_manager.init_physical_shift_prior(source_global, target_global)
+            print("    >>> [Prior Initialized] Physical Shift Prior has been set based on Epoch 1.")
+        # ==========================================================
+
         avg_loss = epoch_loss / num_iter
         train_loss.append(avg_loss)
 
@@ -266,17 +274,37 @@ for iDataSet in range(nDataSet):
             labels = np.array([], dtype=np.int64)
 
             with torch.no_grad():
-                for test_datas, test_labels in test_loader:
-                    batch_size = test_labels.shape[0]
-                    _, _, _, _, _, _, _, _, test_outputs, _ = feature_encoder(source_data.cuda(), test_datas.cuda())
+                for t_data, _ in eval_loader:
+                    dummy_s = torch.zeros_like(t_data)
+                    # 获取特征和输出
+                    _, _, _, _, _, t_feat, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
 
-                    pred = test_outputs.data.max(1)[1]
-                    test_labels_np = test_labels.numpy()
-                    rewards = [1 if pred[j] == test_labels_np[j] else 0 for j in range(batch_size)]
-                    total_rewards += np.sum(rewards)
+                    probs = F.softmax(t_out, dim=1)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
+                    preds = torch.argmax(probs, dim=1)
 
-                    predict = np.append(predict, pred.cpu().numpy())
-                    labels = np.append(labels, test_labels_np)
+                    # 【新增创新点】：计算目标域样本与源域对应类别原型（Prototypes）的欧式距离
+                    # 这代表了该样本的“域漂移程度”
+                    shift_distances = torch.zeros(len(preds)).cuda()
+                    for c in range(CLASS_NUM):
+                        mask = (preds == c)
+                        if mask.sum() > 0 and proto_manager.prototypes[c].sum() != 0:
+                            # 计算特征到源域原型的距离
+                            diff = t_feat[mask] - proto_manager.prototypes[c]
+                            shift_distances[mask] = torch.norm(diff, p=2, dim=1)
+
+                    # 将熵和距离归一化后相加，得到最终的 Query Score
+                    # 既要模型不确定 (High Entropy)，又要域差异大 (High Domain Shift)
+                    norm_entropy = (entropy - entropy.min()) / (entropy.max() - entropy.min() + 1e-8)
+                    norm_shift = (shift_distances - shift_distances.min()) / (
+                            shift_distances.max() - shift_distances.min() + 1e-8)
+
+                    query_score = norm_entropy + 0.5 * norm_shift  # 0.5 为平衡系数
+
+                    all_scores.append(query_score.cpu())  # 原来的 all_entropies 替换为 all_scores
+                    all_preds.append(preds.cpu())
+
+            # 后续的 topk 选取逻辑保持不变，但基于 `all_scores` 而非单纯的熵
 
             test_end = time.time()
 
@@ -305,120 +333,135 @@ for iDataSet in range(nDataSet):
 
                 print('\t>>> Best Result Updated!')
 
-            # Active Learning (分层类别感知熵策略)
+            # Active Learning (领域偏移感知 + 分层类别感知策略)
             if epoch % 20 == 0 and epoch < epochs:
                 print(f">>> Active Learning Query at Epoch {epoch}...")
                 feature_encoder.eval()
-                all_entropies = []
-                all_preds = []  # [新增] 必须同时记录预测类别用于分层
+
+                # 【修复】：这里必须把 all_entropies 改成 all_scores
+                all_scores = []
+                all_preds = []
 
                 eval_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
                 with torch.no_grad():
                     for t_data, _ in eval_loader:
                         dummy_s = torch.zeros_like(t_data)
-                        _, _, _, _, _, _, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
+                        _, _, _, _, _, t_feat, _, _, t_out, _ = feature_encoder(dummy_s.cuda(), t_data.cuda())
+
                         probs = F.softmax(t_out, dim=1)
                         entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1)
                         preds = torch.argmax(probs, dim=1)
 
-                        all_entropies.append(entropy.cpu())
+                        # 计算目标域样本与源域对应类别原型（Prototypes）的欧式距离 (代表域漂移程度)
+                        shift_distances = torch.zeros(len(preds)).cuda()
+                        for c in range(CLASS_NUM):
+                            mask = (preds == c)
+                            if mask.sum() > 0 and proto_manager.prototypes[c].sum() != 0:
+                                diff = t_feat[mask] - proto_manager.prototypes[c]
+                                shift_distances[mask] = torch.norm(diff, p=2, dim=1)
+
+                        # 归一化并融合分数 (High Entropy + High Domain Shift)
+                        norm_entropy = (entropy - entropy.min()) / (entropy.max() - entropy.min() + 1e-8)
+                        norm_shift = (shift_distances - shift_distances.min()) / (
+                                shift_distances.max() - shift_distances.min() + 1e-8)
+
+                        query_score = norm_entropy + 0.5 * norm_shift  # 综合得分
+
+                        all_scores.append(query_score.cpu())
                         all_preds.append(preds.cpu())
 
-                all_entropies = torch.cat(all_entropies)
+                # 【修复】：拼接列表
+                all_scores = torch.cat(all_scores)
                 all_preds = torch.cat(all_preds)
 
-                # 掩码初始化：排除已采样的样本
-                candidate_mask = torch.ones_like(all_entropies, dtype=torch.bool)
+                # 掩码初始化
+                candidate_mask = torch.ones_like(all_scores, dtype=torch.bool)
 
                 limit_percent = int(0.01 * len(test_dataset))
                 num_query = min(limit_percent, 100)
 
                 if num_query > 0:
                     new_queries = []
-                    # 1. 计算每个类别的基础配额
                     query_num_per_class = num_query // CLASS_NUM
                     remainder = num_query % CLASS_NUM
 
-                    # 2. 按类别进行独立分层采样
                     for c in range(CLASS_NUM):
-                        # 提取当前类别且未被采样的样本掩码
                         class_mask = (all_preds == c) & candidate_mask
 
                         if class_mask.sum() > 0:
-                            class_entropies = all_entropies.clone()
-                            # 屏蔽非当前类别的样本
-                            class_entropies[~class_mask] = -1.0
+                            # 【修复】：这里原来是 class_entropies = all_entropies.clone()
+                            class_scores = all_scores.clone()
+                            class_scores[~class_mask] = -1.0  # 屏蔽非当前类别的样本
 
-                            # 将余数配额分配给前几个类，确保总数严格等于 num_query
                             quota = query_num_per_class + (1 if c < remainder else 0)
                             actual_k = min(quota, class_mask.sum().item())
 
                             if actual_k > 0:
-                                _, topk_idx = torch.topk(class_entropies, actual_k)
+                                _, topk_idx = torch.topk(class_scores, actual_k)
                                 new_queries.extend(topk_idx.tolist())
 
-                    # 3. 极端回退机制：如果某些类被预测的次数少于配额，导致整体采样不足
-                    # 则用剩余样本中的全局最高熵来补齐差额
+                    # 极端回退机制
                     if len(new_queries) < num_query:
                         shortage = num_query - len(new_queries)
                         remaining_mask = candidate_mask.clone()
-                        remaining_mask[new_queries] = False  # 排除刚才分层已选的
+                        remaining_mask[new_queries] = False
 
-                        fallback_entropies = all_entropies.clone()
-                        fallback_entropies[~remaining_mask] = -1.0
+                        # 【修复】：这里原来是 fallback_entropies
+                        fallback_scores = all_scores.clone()
+                        fallback_scores[~remaining_mask] = -1.0
 
                         actual_shortage = min(shortage, remaining_mask.sum().item())
                         if actual_shortage > 0:
-                            _, fallback_idx = torch.topk(fallback_entropies, actual_shortage)
+                            _, fallback_idx = torch.topk(fallback_scores, actual_shortage)
                             new_queries.extend(fallback_idx.tolist())
 
-                            # 4. 更新数据集 【核心修复：防数据泄露 & 标记目标域样本】
-                    if new_queries:
-                        print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
+                        # 4. 更新数据集 【核心修复：防数据泄露 & 标记目标域样本】
+                if new_queries:
+                    print(f"    Added {len(new_queries)} samples to training set (Class-aware).")
 
-                        # 获取当前 Loader 中的数据
-                        current_source_x = train_loader_s.dataset.tensors[0]
-                        current_source_y = train_loader_s.dataset.tensors[1]
-                        current_source_d = train_loader_s.dataset.tensors[2]  # 获取现有的域标签
+                    # 获取当前 Loader 中的数据
+                    current_source_x = train_loader_s.dataset.tensors[0]
+                    current_source_y = train_loader_s.dataset.tensors[1]
+                    current_source_d = train_loader_s.dataset.tensors[2]  # 获取现有的域标签
 
-                        target_x_all = test_loader.dataset.tensors[0]
-                        target_y_all = test_loader.dataset.tensors[1]
+                    target_x_all = test_loader.dataset.tensors[0]
+                    target_y_all = test_loader.dataset.tensors[1]
 
-                        # 抽取查询到的数据
-                        query_x = target_x_all[new_queries]
-                        query_y = target_y_all[new_queries]
-                        query_d = torch.ones(len(query_y), dtype=torch.int64)  # 【打上目标域标记 1】
+                    # 抽取查询到的数据
+                    query_x = target_x_all[new_queries]
+                    query_y = target_y_all[new_queries]
+                    query_d = torch.ones(len(query_y), dtype=torch.int64)  # 【打上目标域标记 1】
 
-                        # 1. 扩充源域 Loader (带标记)
-                        new_source_x = torch.cat([current_source_x, query_x], dim=0)
-                        new_source_y = torch.cat([current_source_y, query_y], dim=0)
-                        new_source_d = torch.cat([current_source_d, query_d], dim=0)
+                    # 1. 扩充源域 Loader (带标记)
+                    new_source_x = torch.cat([current_source_x, query_x], dim=0)
+                    new_source_y = torch.cat([current_source_y, query_y], dim=0)
+                    new_source_d = torch.cat([current_source_d, query_d], dim=0)
 
-                        new_train_dataset = TensorDataset(new_source_x, new_source_y, new_source_d)
-                        train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                                    drop_last=True, num_workers=4, pin_memory=True)
+                    new_train_dataset = TensorDataset(new_source_x, new_source_y, new_source_d)
+                    train_loader_s = DataLoader(new_train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                drop_last=True, num_workers=4, pin_memory=True)
 
-                        # 2. 从测试集/无监督目标域中【永久剔除】已查询样本，彻底杜绝数据泄露
-                        keep_mask = torch.ones(len(target_y_all), dtype=torch.bool)
-                        keep_mask[new_queries] = False
+                    # 2. 从测试集/无监督目标域中【永久剔除】已查询样本，彻底杜绝数据泄露
+                    keep_mask = torch.ones(len(target_y_all), dtype=torch.bool)
+                    keep_mask[new_queries] = False
 
-                        new_test_x = target_x_all[keep_mask]
-                        new_test_y = target_y_all[keep_mask]
+                    new_test_x = target_x_all[keep_mask]
+                    new_test_y = target_y_all[keep_mask]
 
-                        test_dataset = TensorDataset(new_test_x, new_test_y)
+                    test_dataset = TensorDataset(new_test_x, new_test_y)
 
-                        # 重新生成测试集和目标域Loader
-                        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                                                 drop_last=True)
-                        train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                                    drop_last=True, num_workers=4, pin_memory=True)
+                    # 重新生成测试集和目标域Loader
+                    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                             drop_last=True)
+                    train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                drop_last=True, num_workers=4, pin_memory=True)
 
-                        # 同步更新外部的动态长度
-                        len_source_loader = len(train_loader_s)
-                        len_target_loader = len(train_loader_t)
+                    # 同步更新外部的动态长度
+                    len_source_loader = len(train_loader_s)
+                    len_target_loader = len(train_loader_t)
 
-                        print(
-                            f"    Dataset updated: Source_Loader Size -> {len(new_source_y)} | Test_Loader Size -> {len(new_test_y)}")
+                    print(
+                        f"    Dataset updated: Source_Loader Size -> {len(new_source_y)} | Test_Loader Size -> {len(new_test_y)}")
     # ---------------------------------------------------------
     # 4. 单次循环结束：保存并打印当次结果
     # ---------------------------------------------------------
