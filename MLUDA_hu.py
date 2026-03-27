@@ -195,8 +195,12 @@ for iDataSet in range(nDataSet):
                 # 动态计算当前纯源域的 batch size
                 pure_batch_size = pure_source_mask.sum().item()
 
-                lmmd_loss = mmd.lmmd(pure_source_features, target_features, pure_source_labels.cuda(),
-                                     torch.nn.functional.softmax(target_outputs, dim=1),
+                # 【新增补充修复】：截断 Target 张量，强制对齐 Source 的长度，满足 Weight.py 的严苛要求
+                pure_target_features = target_features[:pure_batch_size]
+                pure_target_outputs = target_outputs[:pure_batch_size]
+
+                lmmd_loss = mmd.lmmd(pure_source_features, pure_target_features, pure_source_labels.cuda(),
+                                     torch.nn.functional.softmax(pure_target_outputs, dim=1),
                                      BATCH_SIZE=pure_batch_size, CLASS_NUM=CLASS_NUM)
             else:
                 lmmd_loss = torch.tensor(0.0).cuda()
