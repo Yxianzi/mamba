@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-import mmd
+import lmmd
 import numpy as np
 from sklearn import metrics
 import time

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-import mmd
+import lmmd
 import numpy as np
 from sklearn import metrics
 from net2 import DSANSS
@@ -166,9 +166,9 @@ for iDataSet in range(nDataSet):
             p = (epoch - 1) / epochs
             lambd = 2 / (1 + math.exp(-10 * p)) - 1
 
-            lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
-                                 torch.nn.functional.softmax(target_outputs, dim=1), BATCH_SIZE=BATCH_SIZE,
-                                 CLASS_NUM=CLASS_NUM)
+            lmmd_loss = lmmd.lmmd(source_features, target_features, source_label,
+                                  torch.nn.functional.softmax(target_outputs, dim=1), BATCH_SIZE=BATCH_SIZE,
+                                  CLASS_NUM=CLASS_NUM)
             all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
             all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
             contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label)

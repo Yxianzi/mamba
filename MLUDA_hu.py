@@ -3,8 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-import mmd
+import lmmd
 import numpy as np
 from sklearn import metrics
 from net2 import DSANSS
@@ -44,7 +43,7 @@ DSH_loss = utils.Domain_Occ_loss().cuda()
 acc = np.zeros([nDataSet, 1])
 A = np.zeros([nDataSet, CLASS_NUM])
 k = np.zeros([nDataSet, 1])
-all_runs_avg_epoch_time = []  # [新增] 用于保存每次 Run 的平均 Epoch 耗时
+all_runs_avg_epoch_time = []
 
 for iDataSet in range(nDataSet):
     print('\n' + '*' * 60)
@@ -56,22 +55,20 @@ for iDataSet in range(nDataSet):
     best_class_acc = np.zeros([CLASS_NUM])
     best_kappa_val = 0.0
     best_oa_val = 0.0
-    best_score = 0.0  # [新增] 综合评分守门员 (OA + AA)
+    best_score = 0.0
     best_G, best_RandPerm, best_Row, best_Column = None, None, None, None
 
-    # [UDA 重构] 源域完全固定，不再需要 source_domain_flags，因为永远不会有目标域真实标签注入
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
     testID, testX, testY, G, RandPerm, Row, Column = utils.get_all_data(data_t, label_t, HalfWidth)
 
     train_dataset = TensorDataset(torch.from_numpy(trainX), torch.from_numpy(trainY).long())
     test_dataset = TensorDataset(torch.from_numpy(testX), torch.from_numpy(testY).long())
 
-    # 使用 pin_memory 加速数据传输
     train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4,
                                 pin_memory=True)
     train_loader_t = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4,
                                 pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE * 8, shuffle=False, drop_last=False, num_workers=4, pin_memory=True)
 
     len_source_loader = len(train_loader_s)
     len_target_loader = len(train_loader_t)
@@ -95,42 +92,41 @@ for iDataSet in range(nDataSet):
         {'params': proto_manager.parameters(), 'lr': 1e-3}
     ], lr=5e-4, weight_decay=1e-4, eps=1e-8)
 
-    # [改进] 采用余弦退火学习率，解决末期震荡无法收敛的问题
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    print("Start Pure UDA Training...")
+    print("Start Training...")
 
     train_loss = []
     oa_list = []
     aa_list = []
     kappa_list = []
-    epoch_times = []  # [新增] 记录当前 Run 中每个 Epoch 的耗时
+    epoch_times = []
 
-    # [新增] 用于 CADT 的全局类别伪标签计数器
-    global_pseudo_counts = torch.ones(CLASS_NUM).cuda()
+    # [核心修改 1]: 初始化 CADT 全局频率池，驻留 GPU 避免反复传输
+    global_pseudo_counts = torch.zeros(CLASS_NUM, device='cuda')
 
     best_episdoe = 0
-    train_end = 0.0
-    test_end = 0.0
     train_start = time.time()
 
     # ==========================================
     # 2. 训练循环
     # ==========================================
     for epoch in range(1, epochs + 1):
-        epoch_start_time = time.time()  # [新增] 记录当前 Epoch 开始时间
+        epoch_start_time = time.time()
 
         current_lr = optimizer.param_groups[0]['lr']
         feature_encoder.train()
 
         iter_source = iter(train_loader_s)
         iter_target = iter(train_loader_t)
-
         num_iter = len(train_loader_s)
-        len_target_loader = len(train_loader_t)
 
         epoch_loss = 0.0
         debug_loss_components = {}
+
+        # [核心修改 2]: Warm-up 课程权重调度 (IE-SPA 预热)
+        # 延迟因子 eta = 0.2, 结合 tanh 曲线平滑爬升
+        lambda_1 = 1.0 * math.tanh(epoch / (epochs * 0.2)) if epoch > 10 else 0.0
 
         for i in range(1, num_iter):
             try:
@@ -147,96 +143,112 @@ for iDataSet in range(nDataSet):
             if i % len_target_loader == 0:
                 iter_target = iter(train_loader_t)
 
-            # [新增] 数据增强：弱增强 vs 强增强 (为跨视图一致性做准备)
-            source_data0 = utils.radiation_noise(source_data).type(torch.FloatTensor)
-            source_data1 = utils.flip_augmentation(source_data)
-            target_data_weak = utils.radiation_noise(target_data).type(torch.FloatTensor)
-            target_data_strong = utils.flip_augmentation(target_data)
+            source_gpu = source_data.cuda(non_blocking=True)
+            target_gpu = target_data.cuda(non_blocking=True)
 
-            # --- 前向传播 ---
-            (source_features, source1, _, source_outputs, source_out,
-             target_features, _, target1, target_outputs, target_out) = feature_encoder(source_data.cuda(),
-                                                                                        target_data.cuda())
+            # --- 弱增强 (辐射噪声) ---
+            alpha_s = torch.empty((source_gpu.size(0), 1, 1, 1), device='cuda').uniform_(0.9, 1.1)
+            source_weak = alpha_s * source_gpu + 0.04 * torch.randn_like(source_gpu)
 
-            # 强弱视图特征提取
-            (_, source2, _, source_outputs2, _, _, _, target2, _, _) = feature_encoder(source_data0.cuda(),
-                                                                                       target_data_weak.cuda())
-            (_, source3, _, source_outputs3, _, _, _, target3, target_outputs_strong, _) = feature_encoder(
-                source_data1.cuda(), target_data_strong.cuda())
+            alpha_t = torch.empty((target_gpu.size(0), 1, 1, 1), device='cuda').uniform_(0.9, 1.1)
+            target_weak = alpha_t * target_gpu + 0.04 * torch.randn_like(target_gpu)
 
-            # --- 监督损失与源域原型更新 ---
+            # --- 强增强 (空间翻转，正确翻转 H=dim2 和 W=dim3) ---
+            source_strong, target_strong = source_gpu.clone(), target_gpu.clone()
+            if torch.rand(1).item() > 0.5:
+                source_strong, target_strong = torch.flip(source_strong, [2]), torch.flip(target_strong, [2])
+            if torch.rand(1).item() > 0.5:
+                source_strong, target_strong = torch.flip(source_strong, [3]), torch.flip(target_strong, [3])
+
+            # ====================================================================
+            # 🚀 极致优化 2: Batch 并行合一 (只做 1 次 3D CNN 前向传播，耗时变成原来的 1/3)
+            # ====================================================================
+            # 将原始、弱、强 拼接成一个大 Batch
+            concat_source = torch.cat([source_gpu, source_weak, source_strong], dim=0)
+            concat_target = torch.cat([target_gpu, target_weak, target_strong], dim=0)
+
+            # 只执行 1 次前向传播！充分喂饱 GPU
+            (all_source_features, _, _, all_source_outputs, all_source_out,
+             all_target_features, _, _, all_target_outputs, all_target_out) = feature_encoder(concat_source,
+                                                                                              concat_target)
+
+            # 切片还原
+            B = source_gpu.size(0)
+            source_features, source2, source3 = torch.split(all_source_features, B)
+            source_outputs, _, _ = torch.split(all_source_outputs, B)
+            source_out, _, _ = torch.split(all_source_out, B)
+
+            target_features, target2, target3 = torch.split(all_target_features, B)
+            target_outputs, _, target_outputs_strong = torch.split(all_target_outputs, B)
+            target_out, _, _ = torch.split(all_target_out, B)
+
+            # --- 1. 源域监督与原型更新 ---
             cls_loss = crossEntropy(source_outputs, source_label.cuda())
             proto_manager.update(source_features.detach(), source_label.cuda())
 
-            p = (epoch - 1) / epochs
-            lambd = 2 / (1 + math.exp(-10 * p)) - 1
-
-            # [UDA 重构] 纯净的 LMMD 损失，无需分离源域中的目标样本（因已剔除 AL）
-            lmmd_loss = mmd.lmmd(source_features, target_features, source_label.cuda(),
-                                 torch.nn.functional.softmax(target_outputs, dim=1),
-                                 BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
-
-            # --- [创新点 1 & 2]: CADT 动态阈值与 IE-SPA 熵加权柔性对齐 ---
+            # --- 2. CADT 类别自适应动态阈值 (纯张量操作，无 CPU 阻塞) ---
             probs_t = F.softmax(target_outputs, dim=1)
             max_probs_t, pseudo_label_t = torch.max(probs_t, dim=1)
-            entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-6), dim=1)
 
-            # 【极速优化 1】: 纯 GPU 并行更新频率，消灭 for 循环和 .item() 同步阻塞
-            counts = torch.bincount(pseudo_label_t, minlength=CLASS_NUM).float()
-            global_pseudo_counts = 0.9 * global_pseudo_counts + 0.1 * counts
+            # 统计当前 Batch 中置信度 > 0.5 的样本频率
+            valid_mask = max_probs_t > 0.5
+            batch_counts = torch.bincount(pseudo_label_t[valid_mask], minlength=CLASS_NUM).float()
 
-            # 提前计算 mask 并只执行【唯一一次】 .item() 同步
-            if epoch > 20:
-                N_max = global_pseudo_counts.max()
-                tau_base = 0.85
-                gamma_cadt = 0.5
-                tau_c = tau_base * ((global_pseudo_counts / N_max) ** gamma_cadt)
-                tau_c = torch.clamp(tau_c, min=0.5, max=0.95)
+            # EMA 更新全局频率池 (EMA alpha = 0.9)
+            global_pseudo_counts.mul_(0.9).add_(batch_counts * 0.1)
 
-                batch_thresholds = tau_c[pseudo_label_t]
-                mask = max_probs_t > batch_thresholds
+            # 计算相对频率并生成阈值
+            max_f = torch.max(global_pseudo_counts) + 1e-6
+            relative_freq = global_pseudo_counts / max_f
+
+            # 少数类门槛放宽至 0.5，多数类收紧至 0.95
+            dynamic_thresholds = 0.5 + 0.45 * relative_freq
+
+            # --- 3. IE-SPA 熵加权柔性对齐 ---
+            # CADT 类别自适应掩码筛选
+            cadt_mask = max_probs_t > dynamic_thresholds[pseudo_label_t]
+            valid_count = cadt_mask.sum().item()  # 仅保留一次极小代价的同步用于控制流判定
+
+            if lambda_1 > 0 and valid_count > 0:
+                # 提取预测信息熵
+                entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-10), dim=1)
+                soft_weight = torch.exp(-entropy_t)
+
+                # 获取源域对应原型
+                target_mu = proto_manager.prototypes[pseudo_label_t]
+
+                # Log-scaled 物理缓冲带 D_soft = ln(1 + ||z - mu||^2)
+                dist_sq = torch.sum((target_features - target_mu) ** 2, dim=1)
+                log_dist = torch.log1p(dist_sq)
+
+                ie_spa_loss = (soft_weight[cadt_mask] * log_dist[cadt_mask]).mean()
             else:
-                mask = max_probs_t > 0.8  # 前20轮用硬阈值过渡
+                ie_spa_loss = torch.tensor(0.0, device='cuda')
 
-            # 【极速优化 2】: 全局仅同步一次验证数量，避免多次 GPU 等待
-            valid_count = mask.sum().item()
-
-            if epoch > 20:
-                if valid_count > 0:
-                    proto_manager.update_target(target_features.detach()[mask], pseudo_label_t[mask])
-
-                    valid_target_features = target_features[mask]
-                    valid_pseudo_labels = pseudo_label_t[mask]
-                    valid_entropy_weights = torch.exp(-entropy_t[mask])
-
-                    target_protos = proto_manager.prototypes[valid_pseudo_labels]
-                    dist = torch.sum((valid_target_features - target_protos) ** 2, dim=1)
-                    sample_pa_loss = 0.2 * torch.log(1 + dist)
-                    pa_loss = torch.mean(valid_entropy_weights * sample_pa_loss)
-                else:
-                    pa_loss = torch.tensor(0.0).cuda()
-            else:
-                pa_loss = torch.tensor(0.0).cuda()
-
-            # --- [创新点 3]: Mamba 跨视图一致性自蒸馏 ---
+            # --- 4. CVC 跨视图一致性自蒸馏 ---
             probs_t_strong = F.softmax(target_outputs_strong, dim=1)
-            consistency_loss = F.kl_div(probs_t_strong.log(), probs_t.detach(), reduction='batchmean')
+            cvc_loss = F.kl_div(probs_t_strong.log(), probs_t.detach(), reduction='batchmean')
 
-            # --- 对比损失及 Houston 特有的 DSH 损失 ---
+            # --- 其他基础 Loss ---
+            p = (epoch - 1) / epochs
+            lambd = 2 / (1 + math.exp(-10 * p)) - 1
+            lmmd_loss = lmmd.lmmd(source_features, target_features, source_label.cuda(), probs_t, BATCH_SIZE=BATCH_SIZE,
+                                  CLASS_NUM=CLASS_NUM)
+            domain_similar_loss = DSH_loss(source_out, target_out)
+
             all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
-            all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
             contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label)
 
-            if valid_count > 2:  # 使用已经取回 CPU 的 valid_count
-                contrastive_loss_t = ContrastiveLoss_t(all_target_con[mask], pseudo_label_t[mask])
+            if valid_count > 2:
+                all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
+                contrastive_loss_t = ContrastiveLoss_t(all_target_con[cadt_mask], pseudo_label_t[cadt_mask])
             else:
                 contrastive_loss_t = torch.tensor(0.0).cuda()
 
-            domain_similar_loss = DSH_loss(source_out, target_out)
-
-            # 组合 Loss (保留 Houston 专属的 0.1 权重比例)
             adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t + 0.1 * domain_similar_loss
-            loss = cls_loss + lambd * adapt_loss + pa_loss + lambd * consistency_loss
+
+            # --- 总体 Loss 组合 ---
+            loss = cls_loss + lambd * adapt_loss + lambda_1 * ie_spa_loss + 0.1 * cvc_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -249,17 +261,11 @@ for iDataSet in range(nDataSet):
                 debug_loss_components = {
                     'Cls': cls_loss.item(),
                     'Adapt': (lambd * adapt_loss).item(),
-                    'PA': pa_loss.item(),
-                    'Consist': (lambd * consistency_loss).item()
+                    'PA': (lambda_1 * ie_spa_loss).item(),
+                    'Consist': (0.1 * cvc_loss).item()
                 }
 
         scheduler.step()
-
-        if epoch == 1:
-            source_global = source_features.detach().mean(0)
-            target_global = target_features.detach().mean(0)
-            proto_manager.init_physical_shift_prior(source_global, target_global)
-            print("    >>> [Prior Initialized] Physical Shift Prior has been set based on Epoch 1.")
 
         avg_loss = epoch_loss / num_iter
         train_loss.append(avg_loss)
@@ -298,8 +304,8 @@ for iDataSet in range(nDataSet):
         aa_value = 100. * np.mean(AA_current)
         aa_list.append(aa_value)
 
-        epoch_end_time = time.time()  # [新增] 记录当前 Epoch 结束时间
-        epoch_duration = epoch_end_time - epoch_start_time  # [新增] 计算当前 Epoch 耗时
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
         epoch_times.append(epoch_duration)
 
         print(
@@ -310,7 +316,6 @@ for iDataSet in range(nDataSet):
 
         print('\tOA: {:.2f}% | AA: {:.2f}% | Kappa: {:.4f}'.format(test_accuracy, aa_value, current_kappa))
 
-        # [UDA 重构] 综合得分守门，防末端震荡
         current_score = test_accuracy + aa_value
         if current_score > best_score:
             best_score = current_score
@@ -357,7 +362,7 @@ for iDataSet in range(nDataSet):
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Accuracy (%)', color=color)
     line1 = ax1.plot(range(1, len(oa_list) + 1), oa_list, label='OA', color='red', linestyle='-')
-    line2 = ax1.plot(range(1, len(aa_list) + 1), aa_list, label='AA', color='green', linestyle='-.')  # 增加 AA 曲线
+    line2 = ax1.plot(range(1, len(aa_list) + 1), aa_list, label='AA', color='green', linestyle='-.')
     line3 = ax1.plot(range(1, len(kappa_list) + 1), kappa_list, label='Kappa (x100)', color='orange', linestyle='--')
     ax1.tick_params(axis='y', labelcolor=color)
     ax1.set_ylim([0, 100])
