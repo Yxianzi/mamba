@@ -198,44 +198,67 @@ for iDataSet in range(nDataSet):
             valid_count = mask.sum().item()
 
             # ====================================================================
-            # 🚀 修复2: IE-SPA 熵加权柔性对齐 (加上 .detach() 彻底阻断梯度泄露)
+            # 🚀 你的原创 1: CADT 动态阈值 (用于对比学习和一致性约束)
             # ====================================================================
-            if epoch > 20 and valid_count > 0:
-                valid_target_features = target_features[mask]
-                valid_pseudo_labels = pseudo_label_t[mask]
+            max_probs_t, pseudo_label_t = torch.max(probs_t, dim=1)
 
-                entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-10), dim=1)
+            valid_stats_mask = max_probs_t > 0.5
+            counts = torch.bincount(pseudo_label_t[valid_stats_mask], minlength=CLASS_NUM).float()
+            global_pseudo_counts = 0.9 * global_pseudo_counts + 0.1 * counts
 
-                # 【极其关键的修复】：必须 detach，防止网络通过降低自信心逃避损失
-                valid_entropy_weights = torch.exp(-entropy_t[mask]).detach()
+            if epoch > 20:
+                N_max = global_pseudo_counts.max() + 1e-6
+                relative_freq = global_pseudo_counts / N_max
+                tau_c = 0.5 + 0.45 * relative_freq  # 劫富济贫
+                batch_thresholds = tau_c[pseudo_label_t]
+                mask_cadt = max_probs_t > batch_thresholds  # 用于对比学习的宽掩码
+            else:
+                mask_cadt = max_probs_t > 0.8
 
-                # 【保护】：源域原型必须 detach，防止目标域反向污染源域分布
-                target_protos = proto_manager.prototypes[valid_pseudo_labels].detach()
+            valid_count_cadt = mask_cadt.sum().item()
 
-                dist = torch.sum((valid_target_features - target_protos) ** 2, dim=1)
-                sample_pa_loss = 0.2 * torch.log1p(dist)
+            # ====================================================================
+            # 🚀 你的原创 2: IE-SPA 熵加权柔性对齐 (完美修复版)
+            # ====================================================================
+            if epoch > 20:
+                # 1. 熵门控 (Entropy Gating): 剔除含糊不清的伪标签
+                entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-8), dim=1)
+                entropy_norm = entropy_t / math.log(CLASS_NUM)  # 归一化到 [0, 1]
 
-                pa_loss = torch.mean(valid_entropy_weights * sample_pa_loss)
+                # 只有熵极低 (预测极其自信，例如 < 0.2) 的样本，才有资格更新原型
+                confident_mask = entropy_norm < 0.2
+
+                if confident_mask.sum().item() > 0:
+                    proto_manager.update_target(target_features[confident_mask], pseudo_label_t[confident_mask])
+
+                # 2. 超球面余弦对齐 (彻底取代欧氏距离，消灭霸权类别)
+                pa_loss_val = proto_manager.get_spherical_alignment_loss()
+
+                # 余弦距离本身非常平滑，无需 log1p，直接施加温和引力
+                pa_loss = 0.1 * pa_loss_val
             else:
                 pa_loss = torch.tensor(0.0).cuda()
 
-            # CVC 一致性损失
+
+            # --- 你的原创 3: CVC 跨视图一致性 ---
             log_probs_t_strong = F.log_softmax(target_outputs_strong, dim=1)
             consistency_loss = F.kl_div(log_probs_t_strong, probs_t.detach(), reduction='batchmean')
 
-            # 对比与域相似损失
+            # --- 对比损失 ---
             all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
+            all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
             contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label.cuda())
 
-            if valid_count > 2:
-                all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
-                contrastive_loss_t = ContrastiveLoss_t(all_target_con[mask], pseudo_label_t[mask])
+            # 【注意】：这里使用宽掩码 mask_cadt，充分发挥 CADT 劫富济贫的作用
+            if valid_count_cadt > 2:
+                contrastive_loss_t = ContrastiveLoss_t(all_target_con[mask_cadt], pseudo_label_t[mask_cadt])
             else:
                 contrastive_loss_t = torch.tensor(0.0).cuda()
 
             domain_similar_loss = DSH_loss(source_out, target_out)
-            adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t + 0.1 * domain_similar_loss
 
+            # 总体损失组合，四大天王完美发力！
+            adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t + 0.1 * domain_similar_loss
             loss = cls_loss + lambd * adapt_loss + pa_loss + lambd * consistency_loss
 
             optimizer.zero_grad()
