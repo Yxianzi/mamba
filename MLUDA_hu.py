@@ -177,17 +177,22 @@ for iDataSet in range(nDataSet):
             lmmd_loss = lmmd.lmmd(source_features, target_features, source_label.cuda(), probs_t,
                                  BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
 
-            # CADT 与 IE-SPA
+            # ====================================================================
+            # 🚀 修复1: CADT 劫富济贫动态阈值 (彻底杜绝低置信度污染)
+            # ====================================================================
             max_probs_t, pseudo_label_t = torch.max(probs_t, dim=1)
-            entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-6), dim=1)
 
-            counts = torch.bincount(pseudo_label_t, minlength=CLASS_NUM).float()
+            # 【关键】只统计当前 Batch 中预测概率大于 0.5 的样本，过滤噪声！
+            valid_stats_mask = max_probs_t > 0.5
+            counts = torch.bincount(pseudo_label_t[valid_stats_mask], minlength=CLASS_NUM).float()
+
             global_pseudo_counts = 0.9 * global_pseudo_counts + 0.1 * counts
 
             if epoch > 20:
-                N_max = global_pseudo_counts.max()
-                tau_c = 0.85 * ((global_pseudo_counts / N_max) ** 0.5)
-                tau_c = torch.clamp(tau_c, min=0.5, max=0.95)
+                N_max = global_pseudo_counts.max() + 1e-6
+                relative_freq = global_pseudo_counts / N_max
+                # 线性映射: 少数类门槛放宽至 0.5，多数类收紧至 0.95
+                tau_c = 0.5 + 0.45 * relative_freq
                 batch_thresholds = tau_c[pseudo_label_t]
                 mask = max_probs_t > batch_thresholds
             else:
@@ -195,14 +200,26 @@ for iDataSet in range(nDataSet):
 
             valid_count = mask.sum().item()
 
+            # ====================================================================
+            # 🚀 修复2: IE-SPA 熵加权柔性对齐 (彻底阻断梯度泄露，防止优化器作弊)
+            # ====================================================================
             if epoch > 20 and valid_count > 0:
                 valid_target_features = target_features[mask]
                 valid_pseudo_labels = pseudo_label_t[mask]
-                valid_entropy_weights = torch.exp(-entropy_t[mask])
 
-                target_protos = proto_manager.prototypes[valid_pseudo_labels]
+                # 计算熵
+                entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-10), dim=1)
+
+                # 【致命修复】必须加 .detach()！绝不允许网络通过降低自信心来逃避 Loss！
+                valid_entropy_weights = torch.exp(-entropy_t[mask]).detach()
+
+                # 【保护】源域原型也必须 detach，防止目标域拉扯破坏了源域的纯净特征分布
+                target_protos = proto_manager.prototypes[valid_pseudo_labels].detach()
+
                 dist = torch.sum((valid_target_features - target_protos) ** 2, dim=1)
-                sample_pa_loss = 0.2 * torch.log(1 + dist)
+                # 使用 log1p 保证极端漂移下的数值和梯度稳定
+                sample_pa_loss = 0.2 * torch.log1p(dist)
+
                 pa_loss = torch.mean(valid_entropy_weights * sample_pa_loss)
             else:
                 pa_loss = torch.tensor(0.0).cuda()
