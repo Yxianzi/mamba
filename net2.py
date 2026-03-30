@@ -1,5 +1,4 @@
-# [文件名: net2.py]
-# High-Accuracy Hybrid Architecture (Deep CNN + Mamba)
+#(Deep CNN + Mamba)
 
 import torch
 import torch.nn as nn
