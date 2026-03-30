@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import mmd
+import lmmd
 import numpy as np
 from sklearn import metrics
 from net2 import DSANSS
@@ -15,6 +15,7 @@ from config_Houston import *
 import os
 from eta_mamba_modules import TemporalPrototypeManager
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from UtilsCMS import *
 
 ##################################
 # 0. 准备工作
@@ -29,7 +30,7 @@ label_path_t = './datasets/Houston/Houston18_7gt.mat'
 data_s, label_s = utils.load_data_houston(data_path_s, label_path_s)
 data_t, label_t = utils.load_data_houston(data_path_t, label_path_t)
 
-data_s, data_t = utils.ILDA(data_s, data_t, pca_n, radius)
+data_s, data_t = ILDA(data_s, data_t, pca_n, radius)
 
 # Loss Function
 crossEntropy = nn.CrossEntropyLoss(label_smoothing=0.1).cuda()
@@ -173,7 +174,7 @@ for iDataSet in range(nDataSet):
             lambd = 2 / (1 + math.exp(-10 * p)) - 1
 
             probs_t = F.softmax(target_outputs, dim=1)
-            lmmd_loss = mmd.lmmd(source_features, target_features, source_label.cuda(), probs_t,
+            lmmd_loss = lmmd.lmmd(source_features, target_features, source_label.cuda(), probs_t,
                                  BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
 
             # CADT 与 IE-SPA
