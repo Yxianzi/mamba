@@ -196,7 +196,6 @@ for iDataSet in range(nDataSet):
             valid_count = mask.sum().item()
 
             if epoch > 20 and valid_count > 0:
-                proto_manager.update_target(target_features.detach()[mask], pseudo_label_t[mask])
                 valid_target_features = target_features[mask]
                 valid_pseudo_labels = pseudo_label_t[mask]
                 valid_entropy_weights = torch.exp(-entropy_t[mask])

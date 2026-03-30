@@ -276,24 +276,7 @@ def obtain_label(loader, net):
 
     return predict, output
 
-def Weighted_CrossEntropy(input_,labels):
-    input_s = F.softmax(input_)
-    entropy = -input_s * torch.log(input_s + 1e-5)
-    entropy = torch.sum(entropy, dim=1)
-    weight = 1.0 + torch.exp(-entropy)
-    weight = weight / torch.sum(weight).detach().item()
-    #print("cross:",nn.CrossEntropyLoss(reduction='none')(input_, labels))
-    return torch.mean(weight * nn.CrossEntropyLoss(reduction='none')(input_, labels))
 
-def twist_loss(p1,p2,alpha=1,beta=1):
-    eps=1e-7 #ensure calculate
-    #eps=0
-    kl_div=((p2*p2.log()).sum(dim=1)-(p2*p1.log()).sum(dim=1)).mean()
-    mean_entropy=-(p1*(p1.log()+eps)).sum(dim=1).mean()
-    mean_prob=p1.mean(dim=0)
-    entropy_mean=-(mean_prob*(mean_prob.log()+eps)).sum()
-
-    return kl_div + alpha * mean_entropy - beta * entropy_mean
 def extract_embeddings(model, dataloader):
     model.eval()
     n_samples = dataloader.batch_size * len(dataloader)
@@ -339,14 +322,6 @@ def set_seed(seed):
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
-def Weighted_CrossEntropy(input_,labels):
-    input_s = F.softmax(input_, dim=1)
-    entropy = -input_s * torch.log(input_s + 1e-5)
-    entropy = torch.sum(entropy, dim=1)
-    weight = 1.0 + torch.exp(-entropy)
-    weight = weight / torch.sum(weight).detach().item()
-    #print("cross:",nn.CrossEntropyLoss(reduction='none')(input_, labels))
-    return torch.mean(weight * nn.CrossEntropyLoss(reduction='none')(input_, labels))
 
 def classification_map(map, groundTruth, dpi, savePath):
 

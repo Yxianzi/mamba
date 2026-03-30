@@ -3,20 +3,6 @@ import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
 
-class BiSSMBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.forward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.backward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.proj = nn.Linear(d_model * 2, d_model)
-
-    def forward(self, x):
-        out_f = self.forward_mamba(x)
-        out_b = self.backward_mamba(x.flip(dims=[1])).flip(dims=[1])
-        out = torch.cat([out_f, out_b], dim=-1)
-        return self.proj(out)
-
-
 class TemporalPrototypeManager(nn.Module):
     def __init__(self, class_num, feature_dim, momentum=0.9):
         super().__init__()
