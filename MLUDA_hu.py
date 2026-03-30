@@ -86,7 +86,7 @@ for iDataSet in range(nDataSet):
 
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    print("Start Pure UDA Training...")
+    print("Start Training...")
 
     train_loss, oa_list, aa_list, kappa_list, epoch_times = [], [], [], [], []
     global_pseudo_counts = torch.ones(CLASS_NUM).cuda()

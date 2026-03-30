@@ -4,11 +4,7 @@ import torch.nn.functional as F
 class Weight:
     @staticmethod
     def cal_weight(s_label, t_label, batch_size, CLASS_NUM):
-        """
-        纯 GPU 张量化计算 LMMD 权重，消灭 NumPy 和 CPU 阻塞
-        s_label: 源域真实标签 [batch_size]
-        t_label: 目标域预测概率 [batch_size, CLASS_NUM]
-        """
+
         # 1. 源域 One-hot 编码与归一化
         s_vec_label = F.one_hot(s_label, num_classes=CLASS_NUM).float() # [batch_size, CLASS_NUM]
         s_sum = s_vec_label.sum(dim=0, keepdim=True)
