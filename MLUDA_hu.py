@@ -174,6 +174,23 @@ for iDataSet in range(nDataSet):
             lambd = 2 / (1 + math.exp(-10 * p)) - 1
 
             probs_t = F.softmax(target_outputs, dim=1)
+
+            # 将 (B, CLASS_NUM) 视为特征向量，计算 Batch 内样本的特征相似度图
+            with torch.no_grad():
+                # 利用 Target 域的深度特征计算样本间相似度矩阵
+                t_feat_norm = F.normalize(target_features.detach(), p=2, dim=1)
+                aff_matrix = torch.mm(t_feat_norm, t_feat_norm.T)  # (B, B)
+                # 仅保留相似度 Top-K (如 K=3) 的邻居关系，剔除噪声
+                topk_vals, topk_idx = torch.topk(aff_matrix, k=4, dim=1)
+                mask_aff = torch.zeros_like(aff_matrix).scatter_(1, topk_idx, 1.0)
+                aff_matrix = aff_matrix * mask_aff
+                aff_matrix = F.normalize(aff_matrix, p=1, dim=1)  # 行归一化
+
+                # 利用特征相似度图对预测概率进行拓扑平滑 (Graph Convolution 思想)
+                smoothed_probs_t = torch.mm(aff_matrix, probs_t)
+
+            # 后续的伪标签生成全部使用平滑后的概率
+            max_probs_t, pseudo_label_t = torch.max(smoothed_probs_t, dim=1)
             lmmd_loss = lmmd.lmmd(source_features, target_features, source_label.cuda(), probs_t,
                                  BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
 
@@ -250,8 +267,14 @@ for iDataSet in range(nDataSet):
             contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label.cuda())
 
             # 【注意】：这里使用宽掩码 mask_cadt，充分发挥 CADT 劫富济贫的作用
-            if valid_count_cadt > 2:
-                contrastive_loss_t = ContrastiveLoss_t(all_target_con[mask_cadt], pseudo_label_t[mask_cadt])
+            entropy_t_con = -torch.sum(probs_t * torch.log(probs_t + 1e-8), dim=1)
+            entropy_norm_con = entropy_t_con / math.log(CLASS_NUM)
+
+            # 对比学习样本池：必须同时满足 CADT 阈值和低熵条件 (双重保险)
+            mask_con = mask_cadt & (entropy_norm_con < 0.3)
+
+            if mask_con.sum().item() > 2:
+                contrastive_loss_t = ContrastiveLoss_t(all_target_con[mask_con], pseudo_label_t[mask_con])
             else:
                 contrastive_loss_t = torch.tensor(0.0).cuda()
 

@@ -72,6 +72,9 @@ class DSANSS(nn.Module):
         self.head1 = nn.Sequential(nn.Linear(288, 128))
         self.head2 = nn.Sequential(nn.Linear(288, 128))
         self.sigmoid = nn.Sigmoid()
+        self.spec_proj_in = nn.Linear(49, 64)
+        self.spectral_mamba = Mamba(d_model=64, d_state=16, d_conv=4, expand=2)
+        self.spec_proj_out = nn.Linear(64, 49)
 
     def forward(self, x, y):
         features_x, features_y = self.feature_layers(x, y)
@@ -138,6 +141,11 @@ class DCRN_Mamba(nn.Module):
         # 使用 Mamba 建模空间序列 (49个Token)
         self.mamba_block = BiSSMBlock(d_model=self.inter_size)
 
+        # 光谱序列建模模块 (处理 288 个 Token，将原空间维度 49 投影至 Mamba 规范维度 64)
+        self.spec_proj_in = nn.Linear(49, 64)
+        self.spectral_mamba = BiSSMBlock(d_model=64)
+        self.spec_proj_out = nn.Linear(64, 49)
+
         self.ca = ChannelAttention(self.inter_size)
         self.sa = SpatialAttention()
 
@@ -167,16 +175,39 @@ class DCRN_Mamba(nn.Module):
         x_feat = self.forward_features_cnn(x)
         y_feat = self.forward_features_cnn(y)
 
-        # 2. Mamba 全局建模 (Global Context)
-        # 变换为序列: (B, 288, H, W) -> (B, H*W, 288)
+        # 2. S2D-Mamba 空谱解耦建模 (Spatial-Spectral Decoupled Context)
         B, C, H, W = x_feat.shape
-        x_seq = x_feat.view(B, C, -1).permute(0, 2, 1)
-        y_seq = y_feat.view(B, C, -1).permute(0, 2, 1)
+        L = H * W  # 49
 
-        x_seq = self.mamba_block(x_seq)  # Mamba 处理
-        y_seq = self.mamba_block(y_seq)
+        # --- (a) 空间序列建模 (Spatial Mamba) ---
+        # 变换为: (B, 49, 288)
+        x_spa = x_feat.view(B, C, L).permute(0, 2, 1)
+        y_spa = y_feat.view(B, C, L).permute(0, 2, 1)
 
-        # 变回图像维度以便进行 Attention
+        x_spa = self.mamba_block(x_spa)
+        y_spa = self.mamba_block(y_spa)
+
+        # --- (b) 光谱序列建模 (Spectral Mamba) ---
+        # 变换为: (B, 288, 49)
+        x_spe = x_spa.permute(0, 2, 1)
+        y_spe = y_spa.permute(0, 2, 1)
+
+        # 线性投影至 64 维以符合 SSM 的计算约束
+        x_spe = self.spec_proj_in(x_spe)  # (B, 288, 64)
+        y_spe = self.spec_proj_in(y_spe)
+
+        x_spe = self.spectral_mamba(x_spe)
+        y_spe = self.spectral_mamba(y_spe)
+
+        # 还原回 49 维
+        x_spe = self.spec_proj_out(x_spe)  # (B, 288, 49)
+        y_spe = self.spec_proj_out(y_spe)
+
+        # --- (c) 空谱特征残差融合 ---
+        x_seq = x_spa + x_spe.permute(0, 2, 1)  # (B, 49, 288)
+        y_seq = y_spa + y_spe.permute(0, 2, 1)
+
+        # 变回图像维度以便进行 Attention: (B, 288, H, W)
         x_feat = x_seq.permute(0, 2, 1).view(B, C, H, W)
         y_feat = y_seq.permute(0, 2, 1).view(B, C, H, W)
 
