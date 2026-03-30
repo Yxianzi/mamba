@@ -1,4 +1,4 @@
-nDataSet = 10
+nDataSet = 1
 
 BATCH_SIZE = 64
 epochs = 100
