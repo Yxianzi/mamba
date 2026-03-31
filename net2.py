@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 from eta_mamba_modules import BiSSMBlock
+from eta_mamba_modules import BiSSMBlock_1D
+
 
 
 # ----------------- 1. 基础模块定义 -----------------
@@ -114,7 +116,7 @@ class DCRN_Mamba(nn.Module):
         self.mamba_block = BiSSMBlock(d_model=self.inter_size)
 
         self.spec_proj_in = nn.Linear(self.L, 64)
-        self.spectral_mamba = BiSSMBlock(d_model=64)
+        self.spectral_mamba = BiSSMBlock_1D(d_model=64)
         self.spec_proj_out = nn.Linear(64, self.L)
 
         # 零初始化

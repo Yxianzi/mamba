@@ -5,6 +5,24 @@ from mamba_ssm import Mamba
 import math
 
 
+
+
+class BiSSMBlock_1D(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.forward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.backward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.combine = nn.Linear(d_model * 2, d_model)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        out_f = self.forward_mamba(x)
+        out_b = self.backward_mamba(x.flip(dims=[1])).flip(dims=[1])
+        out = self.combine(torch.cat([out_f, out_b], dim=-1))
+        return out + residual
+
 # ==============================================================================
 # 🚀 创新一：全向空间-光谱曼巴 (Omni-Directional Spatial-Spectral Mamba)
 # ==============================================================================
