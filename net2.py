@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 
-
 # ----------------- 1. 基础模块定义 -----------------
 
 class BiSSMBlock(nn.Module):
@@ -72,9 +71,7 @@ class DSANSS(nn.Module):
         self.head1 = nn.Sequential(nn.Linear(288, 128))
         self.head2 = nn.Sequential(nn.Linear(288, 128))
         self.sigmoid = nn.Sigmoid()
-        self.spec_proj_in = nn.Linear(49, 64)
-        self.spectral_mamba = Mamba(d_model=64, d_state=16, d_conv=4, expand=2)
-        self.spec_proj_out = nn.Linear(64, 49)
+        # 清除冗余的 spec_proj_in, spectral_mamba, spec_proj_out 初始化
 
     def forward(self, x, y):
         features_x, features_y = self.feature_layers(x, y)
@@ -138,7 +135,7 @@ class DCRN_Mamba(nn.Module):
         self.inter_size = 192 + 96  # 288
 
         # --- 全局特征优化 (Mamba + Attention) ---
-        # 使用 Mamba 建模空间序列 (49个Token)
+        # 空间序列建模模块
         self.mamba_block = BiSSMBlock(d_model=self.inter_size)
 
         # 光谱序列建模模块 (处理 288 个 Token，将原空间维度 49 投影至 Mamba 规范维度 64)
@@ -171,59 +168,50 @@ class DCRN_Mamba(nn.Module):
         return out
 
     def forward(self, x, y):
-        # 1. Deep 3D-CNN 提取 (Robust Features)
+        # 1. Deep 3D-CNN 提取
         x_feat = self.forward_features_cnn(x)
         y_feat = self.forward_features_cnn(y)
 
-        # 2. S2D-Mamba 空谱解耦建模 (Spatial-Spectral Decoupled Context)
         B, C, H, W = x_feat.shape
         L = H * W  # 49
 
-        # --- (a) 空间序列建模 (Spatial Mamba) ---
-        # 变换为: (B, 49, 288)
-        x_spa = x_feat.view(B, C, L).permute(0, 2, 1)
+        # 2. 串行空谱解耦建模 (Sequential Spatial-Spectral Modeling)
+        # --- (a) 空间建模阶段 ---
+        x_spa = x_feat.view(B, C, L).permute(0, 2, 1)  # (B, 49, 288)
         y_spa = y_feat.view(B, C, L).permute(0, 2, 1)
-
         x_spa = self.mamba_block(x_spa)
         y_spa = self.mamba_block(y_spa)
 
-        # --- (b) 光谱序列建模 (Spectral Mamba) ---
-        # 变换为: (B, 288, 49)
-        x_spe = x_spa.permute(0, 2, 1)
+        # --- (b) 光谱建模阶段 (在空间特征的基础上进一步提纯) ---
+        x_spe = x_spa.permute(0, 2, 1)  # (B, 288, 49)
         y_spe = y_spa.permute(0, 2, 1)
 
-        # 线性投影至 64 维以符合 SSM 的计算约束
-        x_spe = self.spec_proj_in(x_spe)  # (B, 288, 64)
-        y_spe = self.spec_proj_in(y_spe)
+        # 投影至 64 维进行 Mamba 处理
+        x_spe_mid = self.spec_proj_in(x_spe)
+        y_spe_mid = self.spec_proj_in(y_spe)
 
-        x_spe = self.spectral_mamba(x_spe)
-        y_spe = self.spectral_mamba(y_spe)
+        x_spe_mid = self.spectral_mamba(x_spe_mid)
+        y_spe_mid = self.spectral_mamba(y_spe_mid)
 
-        # 还原回 49 维
-        x_spe = self.spec_proj_out(x_spe)  # (B, 288, 49)
-        y_spe = self.spec_proj_out(y_spe)
+        # 还原回空间维度并应用激活函数防止梯度消失
+        x_spe = F.gelu(self.spec_proj_out(x_spe_mid))
+        y_spe = F.gelu(self.spec_proj_out(y_spe_mid))
 
-        # --- (c) 空谱特征残差融合 ---
-        x_seq = x_spa + x_spe.permute(0, 2, 1)  # (B, 49, 288)
-        y_seq = y_spa + y_spe.permute(0, 2, 1)
+        # --- (c) 特征重组 (摒弃加法，改为转置还原) ---
+        # 直接使用光谱建模后的特征，它已经融合了空间 Mamba 的输出
+        x_feat = x_spe.view(B, C, H, W)
+        y_feat = y_spe.view(B, C, H, W)
 
-        # 变回图像维度以便进行 Attention: (B, 288, H, W)
-        x_feat = x_seq.permute(0, 2, 1).view(B, C, H, W)
-        y_feat = y_seq.permute(0, 2, 1).view(B, C, H, W)
-
-        # 3. 3D Attention (Refinement)
-        # 维度适配: (B, C, H, W) -> (B, C, 1, H, W)
+        # 3. 3D Attention (保持原样)
         x_feat = x_feat.unsqueeze(2)
         y_feat = y_feat.unsqueeze(2)
-
         x_feat = self.ca(x_feat) * self.sa(x_feat) * x_feat
         y_feat = self.ca(y_feat) * self.sa(y_feat) * y_feat
-
         x_feat = x_feat.squeeze(2)
         y_feat = y_feat.squeeze(2)
 
         # 4. Global Pooling
-        feat_x = x_feat.mean(dim=(2, 3))  # (B, 288)
+        feat_x = x_feat.mean(dim=(2, 3))
         feat_y = y_feat.mean(dim=(2, 3))
 
         return feat_x, feat_y

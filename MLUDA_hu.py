@@ -280,14 +280,21 @@ for iDataSet in range(nDataSet):
 
             domain_similar_loss = DSH_loss(source_out, target_out)
 
-            # 总体损失组合，四大天王完美发力！
-            adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t + 0.1 * domain_similar_loss
+            # 1. 局部条件熵最小化 (促使目标域个体样本预测尖锐，形成紧凑类簇)
+            entropy_loss = -torch.mean(torch.sum(probs_t * torch.log(probs_t + 1e-8), dim=1))
+
+            # 2. 全局边缘熵最大化 (促使目标域全局预测均匀，防止模型陷入仅预测多数类的平凡解)
+            mean_probs_t = torch.mean(probs_t, dim=0)
+            diversity_loss = torch.sum(mean_probs_t * torch.log(mean_probs_t + 1e-8))
+
+            # IM Loss 等于条件熵加上负的边缘熵
+            im_loss = entropy_loss + diversity_loss
+
+            # 总体损失组合，引入 im_loss
+            adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t + 0.1 * domain_similar_loss + 0.1 * im_loss
             loss = cls_loss + lambd * adapt_loss + pa_loss + lambd * consistency_loss
 
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(feature_encoder.parameters(), max_norm=5.0)
-            optimizer.step()
 
             # 累加 Loss
             ep_loss += loss.item()

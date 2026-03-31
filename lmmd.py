@@ -1,15 +1,19 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+import torch.nn.functional as F
 import torch
 from Weight import Weight
 
 
 def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
     """
-    计算多核高斯核矩阵 (Multi-Kernel Gaussian)
-    供 LMMD 调用
+    统一在单位超球面上计算高斯核
     """
+    # 增加严格的 L2 归一化，统一约束到超球面
+    source = F.normalize(source, p=2, dim=1)
+    target = F.normalize(target, p=2, dim=1)
+
     n_samples = int(source.size()[0]) + int(target.size()[0])
     total = torch.cat([source, target], dim=0)
     total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
