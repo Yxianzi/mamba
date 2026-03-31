@@ -1,9 +1,8 @@
-#(Deep CNN + Mamba)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
+
 
 # ----------------- 1. 基础模块定义 -----------------
 
@@ -16,13 +15,12 @@ class BiSSMBlock(nn.Module):
         self.combine = nn.Linear(d_model * 2, d_model)
 
     def forward(self, x):
-        # x shape: (B, L, D)
         residual = x
         x = self.norm(x)
         out_f = self.forward_mamba(x)
         out_b = self.backward_mamba(x.flip(dims=[1])).flip(dims=[1])
         out = self.combine(torch.cat([out_f, out_b], dim=-1))
-        return out + residual  # [关键] 残差连接，防止梯度消失
+        return out + residual
 
 
 class ChannelAttention(nn.Module):
@@ -71,7 +69,6 @@ class DSANSS(nn.Module):
         self.head1 = nn.Sequential(nn.Linear(288, 128))
         self.head2 = nn.Sequential(nn.Linear(288, 128))
         self.sigmoid = nn.Sigmoid()
-        # 清除冗余的 spec_proj_in, spectral_mamba, spec_proj_out 初始化
 
     def forward(self, x, y):
         features_x, features_y = self.feature_layers(x, y)
@@ -100,12 +97,10 @@ class DCRN_Mamba(nn.Module):
         self.feature_dim = input_channels
         self.sz = patch_size
 
-        # --- 分支 1: 光谱特征 (Deep Spectral Branch) ---
         self.conv1 = nn.Conv3d(1, 24, kernel_size=(7, 1, 1), stride=(2, 1, 1), bias=True)
         self.bn1 = nn.BatchNorm3d(24)
         self.activation1 = nn.ReLU()
 
-        # 残差块 1 (恢复深度)
         self.conv2 = nn.Conv3d(24, 24, kernel_size=(7, 1, 1), stride=1, padding=(3, 0, 0), bias=True)
         self.bn2 = nn.BatchNorm3d(24)
         self.activation2 = nn.ReLU()
@@ -117,12 +112,10 @@ class DCRN_Mamba(nn.Module):
         self.bn4 = nn.BatchNorm3d(192)
         self.activation4 = nn.ReLU()
 
-        # --- 分支 2: 空间特征 (Deep Spatial Branch) ---
         self.conv5 = nn.Conv3d(1, 24, (self.feature_dim, 1, 1))
         self.bn5 = nn.BatchNorm3d(24)
         self.activation5 = nn.ReLU()
 
-        # 残差块 2 (恢复深度)
         self.conv6 = nn.Conv3d(24, 24, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1), bias=True)
         self.bn6 = nn.BatchNorm3d(24)
         self.activation6 = nn.ReLU()
@@ -130,18 +123,19 @@ class DCRN_Mamba(nn.Module):
         self.bn7 = nn.BatchNorm3d(96)
         self.activation7 = nn.ReLU()
 
-        self.conv8 = nn.Conv3d(24, 96, kernel_size=1)  # Residual connection helper
+        self.conv8 = nn.Conv3d(24, 96, kernel_size=1)
 
-        self.inter_size = 192 + 96  # 288
+        self.inter_size = 192 + 96
 
-        # --- 全局特征优化 (Mamba + Attention) ---
-        # 空间序列建模模块
         self.mamba_block = BiSSMBlock(d_model=self.inter_size)
 
-        # 光谱序列建模模块 (处理 288 个 Token，将原空间维度 49 投影至 Mamba 规范维度 64)
         self.spec_proj_in = nn.Linear(49, 64)
         self.spectral_mamba = BiSSMBlock(d_model=64)
         self.spec_proj_out = nn.Linear(64, 49)
+
+        # 零初始化
+        nn.init.zeros_(self.spec_proj_out.weight)
+        nn.init.zeros_(self.spec_proj_out.bias)
 
         self.ca = ChannelAttention(self.inter_size)
         self.sa = SpatialAttention()
@@ -149,68 +143,67 @@ class DCRN_Mamba(nn.Module):
     def forward_features_cnn(self, x):
         x = x.unsqueeze(1)
 
-        # Branch 1
         x1 = self.activation1(self.bn1(self.conv1(x)))
         residual = x1
         x1 = self.activation2(self.bn2(self.conv2(x1)))
-        x1 = self.activation3(self.bn3(self.conv3(x1))) + residual  # 残差连接
+        x1 = self.activation3(self.bn3(self.conv3(x1))) + residual
         x1 = self.activation4(self.bn4(self.conv4(x1)))
         x1 = x1.reshape(x1.size(0), x1.size(1), x1.size(3), x1.size(4))
 
-        # Branch 2
         x2 = self.activation5(self.bn5(self.conv5(x)))
         residual = self.conv8(x2)
         x2 = self.activation6(self.bn6(self.conv6(x2)))
-        x2 = self.activation7(self.bn7(self.conv7(x2))) + residual  # 残差连接
+        x2 = self.activation7(self.bn7(self.conv7(x2))) + residual
         x2 = x2.reshape(x2.size(0), x2.size(1), x2.size(3), x2.size(4))
 
-        out = torch.cat((x1, x2), 1)  # (B, 288, H, W)
+        out = torch.cat((x1, x2), 1)
         return out
 
     def forward(self, x, y):
-        # 1. Deep 3D-CNN 提取
         x_feat = self.forward_features_cnn(x)
         y_feat = self.forward_features_cnn(y)
 
         B, C, H, W = x_feat.shape
-        L = H * W  # 49
+        L = H * W
 
-        # 2. 串行空谱解耦建模 (Sequential Spatial-Spectral Modeling)
-        # --- (a) 空间建模阶段 ---
-        x_spa = x_feat.view(B, C, L).permute(0, 2, 1)  # (B, 49, 288)
+        # (a) 空间建模阶段
+        x_spa = x_feat.view(B, C, L).permute(0, 2, 1)
         y_spa = y_feat.view(B, C, L).permute(0, 2, 1)
+
         x_spa = self.mamba_block(x_spa)
         y_spa = self.mamba_block(y_spa)
 
-        # --- (b) 光谱建模阶段 (在空间特征的基础上进一步提纯) ---
-        x_spe = x_spa.permute(0, 2, 1)  # (B, 288, 49)
+        # (b) 光谱建模阶段
+        x_spe = x_spa.permute(0, 2, 1)
         y_spe = y_spa.permute(0, 2, 1)
 
-        # 投影至 64 维进行 Mamba 处理
         x_spe_mid = self.spec_proj_in(x_spe)
         y_spe_mid = self.spec_proj_in(y_spe)
 
         x_spe_mid = self.spectral_mamba(x_spe_mid)
         y_spe_mid = self.spectral_mamba(y_spe_mid)
 
-        # 还原回空间维度并应用激活函数防止梯度消失
-        x_spe = F.gelu(self.spec_proj_out(x_spe_mid))
-        y_spe = F.gelu(self.spec_proj_out(y_spe_mid))
+        x_spe_out = self.spec_proj_out(x_spe_mid)
+        y_spe_out = self.spec_proj_out(y_spe_mid)
 
-        # --- (c) 特征重组 (摒弃加法，改为转置还原) ---
-        # 直接使用光谱建模后的特征，它已经融合了空间 Mamba 的输出
-        x_feat = x_spe.view(B, C, H, W)
-        y_feat = y_spe.view(B, C, H, W)
+        # (c) 旁路残差融合
+        x_seq = x_spa + x_spe_out.permute(0, 2, 1)
+        y_seq = y_spa + y_spe_out.permute(0, 2, 1)
 
-        # 3. 3D Attention (保持原样)
+        x_feat = x_seq.permute(0, 2, 1).view(B, C, H, W)
+        y_feat = y_seq.permute(0, 2, 1).view(B, C, H, W)
+
+        # (d) 注意力机制
         x_feat = x_feat.unsqueeze(2)
         y_feat = y_feat.unsqueeze(2)
+
         x_feat = self.ca(x_feat) * self.sa(x_feat) * x_feat
         y_feat = self.ca(y_feat) * self.sa(y_feat) * y_feat
+
         x_feat = x_feat.squeeze(2)
         y_feat = y_feat.squeeze(2)
 
-        # 4. Global Pooling
+        # (e) 聚合输出
         feat_x = x_feat.mean(dim=(2, 3))
         feat_y = y_feat.mean(dim=(2, 3))
 
