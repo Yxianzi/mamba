@@ -72,7 +72,6 @@ for iDataSet in range(nDataSet):
 
     feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()
 
-    print("Initializing Optimizer & Prototype Manager...")
     proto_manager = TemporalPrototypeManager(class_num=CLASS_NUM, feature_dim=288, momentum=0.9).cuda()
 
     optimizer = torch.optim.AdamW([
@@ -85,8 +84,6 @@ for iDataSet in range(nDataSet):
     ], lr=5e-4, weight_decay=1e-4, eps=1e-8)
 
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    print("Start Training...")
 
     train_loss, oa_list, aa_list, kappa_list, epoch_times = [], [], [], [], []
     global_pseudo_counts = torch.ones(CLASS_NUM).cuda()
@@ -106,7 +103,6 @@ for iDataSet in range(nDataSet):
         iter_target = iter(train_loader_t)
         num_iter = len(train_loader_s)
 
-        # 强制追踪整个 Epoch 的平均 Loss
         ep_loss, ep_cls, ep_adapt, ep_pa, ep_consist = 0.0, 0.0, 0.0, 0.0, 0.0
 
         for i in range(num_iter):
@@ -124,7 +120,6 @@ for iDataSet in range(nDataSet):
             if i % len_target_loader == 0:
                 iter_target = iter(train_loader_t)
 
-            # 纯 GPU 数据增强
             source_gpu = source_data.cuda(non_blocking=True)
             target_gpu = target_data.cuda(non_blocking=True)
 
@@ -142,7 +137,6 @@ for iDataSet in range(nDataSet):
                 source_strong = torch.flip(source_strong, [3])
                 target_strong = torch.flip(target_strong, [3])
 
-            # 一次前向传播，极速抽取
             concat_source = torch.cat([source_gpu, source_weak, source_strong], dim=0)
             concat_target = torch.cat([target_gpu, target_weak, target_strong], dim=0)
 
@@ -151,22 +145,17 @@ for iDataSet in range(nDataSet):
 
             B = source_gpu.size(0)
 
-            # 完美解包：严格对齐原版逻辑
             source_features = all_features_x[:B]
             target_features = all_features_y[:B]
-
             source_outputs = all_fea_x[:B]
             target_outputs = all_fea_y[:B]
             target_outputs_strong = all_fea_y[2 * B:]
-
             source_out = all_output_x[:B]
             target_out = all_output_y[:B]
 
-            # 【修复点】对比损失的特征必须取 x1 和 y2！
             source2, source3 = all_x1[B:2 * B], all_x1[2 * B:]
             target2, target3 = all_y2[B:2 * B], all_y2[2 * B:]
 
-            # 监督 Loss 与 原型更新
             cls_loss = crossEntropy(source_outputs, source_label.cuda())
             proto_manager.update(source_features.detach(), source_label.cuda())
 
@@ -174,129 +163,76 @@ for iDataSet in range(nDataSet):
             lambd = 2 / (1 + math.exp(-10 * p)) - 1
 
             probs_t = F.softmax(target_outputs, dim=1)
+            max_probs_t, pseudo_label_t = torch.max(probs_t, dim=1)
 
-            # 将 (B, CLASS_NUM) 视为特征向量，计算 Batch 内样本的特征相似度图
-            with torch.no_grad():
-                # 利用 Target 域的深度特征计算样本间相似度矩阵
-                t_feat_norm = F.normalize(target_features.detach(), p=2, dim=1)
-                aff_matrix = torch.mm(t_feat_norm, t_feat_norm.T)  # (B, B)
-                # 仅保留相似度 Top-K (如 K=3) 的邻居关系，剔除噪声
-                topk_vals, topk_idx = torch.topk(aff_matrix, k=4, dim=1)
-                mask_aff = torch.zeros_like(aff_matrix).scatter_(1, topk_idx, 1.0)
-                aff_matrix = aff_matrix * mask_aff
-                aff_matrix = F.normalize(aff_matrix, p=1, dim=1)  # 行归一化
-
-                # 利用特征相似度图对预测概率进行拓扑平滑 (Graph Convolution 思想)
-                smoothed_probs_t = torch.mm(aff_matrix, probs_t)
-
-            # 后续的伪标签生成全部使用平滑后的概率
-            max_probs_t, pseudo_label_t = torch.max(smoothed_probs_t, dim=1)
+            # 1. 基础 LMMD 对齐
             lmmd_loss = lmmd.lmmd(source_features, target_features, source_label.cuda(), probs_t,
-                                 BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
+                                  BATCH_SIZE=BATCH_SIZE, CLASS_NUM=CLASS_NUM)
 
-            # ====================================================================
-            # 🚀 修复1: CADT 劫富济贫动态阈值 (彻底杜绝低置信度污染)
-            # ====================================================================
-            max_probs_t, pseudo_label_t = torch.max(probs_t, dim=1)
-
-            valid_stats_mask = max_probs_t > 0.5
-            counts = torch.bincount(pseudo_label_t[valid_stats_mask], minlength=CLASS_NUM).float()
-            global_pseudo_counts = 0.9 * global_pseudo_counts + 0.1 * counts
+            # 2. 类别感知动态阈值 (CADT) - 修正阈值下限
+            # 仅使用高置信度样本更新统计量，防止累积错误
+            valid_stats_mask = max_probs_t > 0.8
+            if valid_stats_mask.sum() > 0:
+                counts = torch.bincount(pseudo_label_t[valid_stats_mask], minlength=CLASS_NUM).float()
+                global_pseudo_counts = 0.9 * global_pseudo_counts + 0.1 * counts
 
             if epoch > 20:
                 N_max = global_pseudo_counts.max() + 1e-6
                 relative_freq = global_pseudo_counts / N_max
-                tau_c = 0.5 + 0.45 * relative_freq  # 劫富济贫映射
+                # 将动态阈值区间收紧至 [0.75, 0.95]，切断低质量伪标签的流入
+                tau_c = 0.75 + 0.20 * relative_freq
                 batch_thresholds = tau_c[pseudo_label_t]
-                mask = max_probs_t > batch_thresholds
+                mask_cadt = max_probs_t > batch_thresholds
             else:
-                mask = max_probs_t > 0.8
-
-            valid_count = mask.sum().item()
-
-            # ====================================================================
-            # 🚀 你的原创 1: CADT 动态阈值 (用于对比学习和一致性约束)
-            # ====================================================================
-            max_probs_t, pseudo_label_t = torch.max(probs_t, dim=1)
-
-            valid_stats_mask = max_probs_t > 0.5
-            counts = torch.bincount(pseudo_label_t[valid_stats_mask], minlength=CLASS_NUM).float()
-            global_pseudo_counts = 0.9 * global_pseudo_counts + 0.1 * counts
-
-            if epoch > 20:
-                N_max = global_pseudo_counts.max() + 1e-6
-                relative_freq = global_pseudo_counts / N_max
-                tau_c = 0.5 + 0.45 * relative_freq  # 劫富济贫
-                batch_thresholds = tau_c[pseudo_label_t]
-                mask_cadt = max_probs_t > batch_thresholds  # 用于对比学习的宽掩码
-            else:
-                mask_cadt = max_probs_t > 0.8
+                mask_cadt = max_probs_t > 0.9
 
             valid_count_cadt = mask_cadt.sum().item()
 
-            # ====================================================================
-            # 🚀 你的原创 2: IE-SPA 熵加权柔性对齐 (完美修复版)
-            # ====================================================================
+            # 3. 超球面不确定性感知对齐 (HUA) - 严格熵门控
             if epoch > 20:
-                # 1. 熵门控 (Entropy Gating): 剔除含糊不清的伪标签
                 entropy_t = -torch.sum(probs_t * torch.log(probs_t + 1e-8), dim=1)
-                entropy_norm = entropy_t / math.log(CLASS_NUM)  # 归一化到 [0, 1]
-
-                # 只有熵极低 (预测极其自信，例如 < 0.2) 的样本，才有资格更新原型
-                confident_mask = entropy_norm < 0.2
+                entropy_norm = entropy_t / math.log(CLASS_NUM)
+                # 进一步收紧熵门控至 0.1，确保更新超球面原型的样本具备绝对纯度
+                confident_mask = entropy_norm < 0.1
 
                 if confident_mask.sum().item() > 0:
                     proto_manager.update_target(target_features[confident_mask], pseudo_label_t[confident_mask])
 
-                # 2. 超球面余弦对齐 (彻底取代欧氏距离，消灭霸权类别)
                 pa_loss_val = proto_manager.get_spherical_alignment_loss()
-
-                # 余弦距离本身非常平滑，无需 log1p，直接施加温和引力
-                pa_loss = 0.1 * pa_loss_val
+                pa_loss = 0.5 * pa_loss_val
             else:
                 pa_loss = torch.tensor(0.0).cuda()
+                confident_mask = torch.zeros_like(mask_cadt, dtype=torch.bool)
 
-
-            # --- 你的原创 3: CVC 跨视图一致性 ---
+            # 4. 跨视图一致性与对比损失
             log_probs_t_strong = F.log_softmax(target_outputs_strong, dim=1)
             consistency_loss = F.kl_div(log_probs_t_strong, probs_t.detach(), reduction='batchmean')
 
-            # --- 对比损失 ---
             all_source_con = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)], dim=1)
             all_target_con = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
             contrastive_loss_s = ContrastiveLoss_s(all_source_con, source_label.cuda())
 
-            # 【注意】：这里使用宽掩码 mask_cadt，充分发挥 CADT 劫富济贫的作用
-            entropy_t_con = -torch.sum(probs_t * torch.log(probs_t + 1e-8), dim=1)
-            entropy_norm_con = entropy_t_con / math.log(CLASS_NUM)
-
-            # 对比学习样本池：必须同时满足 CADT 阈值和低熵条件 (双重保险)
-            mask_con = mask_cadt & (entropy_norm_con < 0.3)
+            # 5. 目标域对比学习纯度隔离
+            # 对比学习必须同时满足 CADT 阈值和低熵条件
+            if epoch > 20:
+                mask_con = mask_cadt & confident_mask
+            else:
+                mask_con = mask_cadt
 
             if mask_con.sum().item() > 2:
                 contrastive_loss_t = ContrastiveLoss_t(all_target_con[mask_con], pseudo_label_t[mask_con])
             else:
                 contrastive_loss_t = torch.tensor(0.0).cuda()
 
-            domain_similar_loss = DSH_loss(source_out, target_out)
-
-            # 1. 局部条件熵最小化 (促使目标域个体样本预测尖锐，形成紧凑类簇)
-            entropy_loss = -torch.mean(torch.sum(probs_t * torch.log(probs_t + 1e-8), dim=1))
-
-            # 2. 全局边缘熵最大化 (促使目标域全局预测均匀，防止模型陷入仅预测多数类的平凡解)
-            mean_probs_t = torch.mean(probs_t, dim=0)
-            diversity_loss = torch.sum(mean_probs_t * torch.log(mean_probs_t + 1e-8))
-
-            # IM Loss 等于条件熵加上负的边缘熵
-            im_loss = entropy_loss + diversity_loss
-
-            # 总体损失组合，引入 im_loss
-            adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t + 0.1 * domain_similar_loss + 0.1 * im_loss
+            # 废弃存在冲突的 domain_similar_loss，精简损失空间
+            adapt_loss = 0.01 * lmmd_loss + 0.1 * contrastive_loss_s + 0.1 * contrastive_loss_t
             loss = cls_loss + lambd * adapt_loss + pa_loss + lambd * consistency_loss
 
             optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(feature_encoder.parameters(), max_norm=5.0)
+            optimizer.step()
 
-            # 累加 Loss
             ep_loss += loss.item()
             ep_cls += cls_loss.item()
             ep_adapt += (lambd * adapt_loss).item()
@@ -345,7 +281,6 @@ for iDataSet in range(nDataSet):
         epoch_duration = epoch_end_time - epoch_start_time
         epoch_times.append(epoch_duration)
 
-        # 强制必定输出本轮日志
         print(
             'Ep {:>3d}: Loss: {:.4f} | Cls: {:.4f} | Adapt: {:.4f} | PA: {:.4f} | Consist: {:.4f} | LR: {:.6f} | Time: {:.2f}s'.format(
                 epoch, avg_loss, ep_cls / num_iter, ep_adapt / num_iter,
@@ -391,7 +326,6 @@ for iDataSet in range(nDataSet):
         print("Class " + str(i) + ": " + "{:.2f}".format(100 * best_class_acc[i]))
     print("=" * 40 + "\n")
 
-    # 1. 绘制精度曲线
     plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
 
@@ -409,7 +343,6 @@ for iDataSet in range(nDataSet):
     plt.savefig(f'classificationMap/Houston/UDA_CETA/accuracy_curve_run{iDataSet + 1}.png', dpi=300)
     plt.close()
 
-    # 2. 绘制 Loss 曲线
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_loss) + 1), train_loss, label='Training Loss', color='blue', linewidth=2)
     plt.xlabel('Epoch', fontsize=12)
