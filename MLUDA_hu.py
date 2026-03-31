@@ -198,8 +198,12 @@ for iDataSet in range(nDataSet):
                 if confident_mask.sum().item() > 0:
                     proto_manager.update_target(target_features[confident_mask], pseudo_label_t[confident_mask])
 
-                pa_loss_val = proto_manager.get_spherical_alignment_loss()
-                pa_loss = 0.5 * pa_loss_val
+                    pa_loss_val = proto_manager.get_spherical_alignment_loss()
+                    pa_loss = 0.5 * pa_loss_val
+                else:
+                    #避免当前 batch 无合格样本时计算图阻断
+                    pa_loss = torch.tensor(0.0).cuda(requires_grad=True)
+
             else:
                 pa_loss = torch.tensor(0.0).cuda()
                 confident_mask = torch.zeros_like(mask_cadt, dtype=torch.bool)

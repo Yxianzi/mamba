@@ -2,26 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
+from eta_mamba_modules import BiSSMBlock
 
 
 # ----------------- 1. 基础模块定义 -----------------
-
-class BiSSMBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.forward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.backward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.combine = nn.Linear(d_model * 2, d_model)
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        out_f = self.forward_mamba(x)
-        out_b = self.backward_mamba(x.flip(dims=[1])).flip(dims=[1])
-        out = self.combine(torch.cat([out_f, out_b], dim=-1))
-        return out + residual
-
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
@@ -96,6 +80,7 @@ class DCRN_Mamba(nn.Module):
         super(DCRN_Mamba, self).__init__()
         self.feature_dim = input_channels
         self.sz = patch_size
+        self.L = patch_size * patch_size
 
         self.conv1 = nn.Conv3d(1, 24, kernel_size=(7, 1, 1), stride=(2, 1, 1), bias=True)
         self.bn1 = nn.BatchNorm3d(24)
@@ -126,12 +111,11 @@ class DCRN_Mamba(nn.Module):
         self.conv8 = nn.Conv3d(24, 96, kernel_size=1)
 
         self.inter_size = 192 + 96
-
         self.mamba_block = BiSSMBlock(d_model=self.inter_size)
 
-        self.spec_proj_in = nn.Linear(49, 64)
+        self.spec_proj_in = nn.Linear(self.L, 64)
         self.spectral_mamba = BiSSMBlock(d_model=64)
-        self.spec_proj_out = nn.Linear(64, 49)
+        self.spec_proj_out = nn.Linear(64, self.L)
 
         # 零初始化
         nn.init.zeros_(self.spec_proj_out.weight)

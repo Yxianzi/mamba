@@ -132,3 +132,29 @@ class TemporalPrototypeManager(nn.Module):
             return loss / count
         else:
             return torch.tensor(0.0, device=self.prototypes.device, requires_grad=True)
+
+    def compute_alignment_loss(self, target_features, pseudo_labels):
+        """计算带有梯度的对齐损失，驱动特征编码器参数更新"""
+        loss = 0.0
+        count = 0
+        # 对当前 batch 的目标域特征进行 L2 归一化 (保留梯度)
+        features = F.normalize(target_features, p=2, dim=1)
+
+        for i in range(self.class_num):
+            mask = (pseudo_labels == i)
+            # 仅当当前类别存在有效样本，且源域存在对应原型时计算
+            if mask.any() and self.prototypes[i].sum() != 0:
+                feat_mean = features[mask].mean(0)
+                feat_mean = F.normalize(feat_mean, p=2, dim=0)
+
+                s_proto = self.prototypes[i].detach()  # 源域原型作为锚点阻断梯度
+
+                cos_sim = F.cosine_similarity(feat_mean, s_proto, dim=0)
+                align_error = 1.0 - cos_sim
+                loss = loss + align_error
+                count += 1
+
+        if count > 0:
+            return loss / count
+        else:
+            return torch.tensor(0.0, device=target_features.device, requires_grad=True)
